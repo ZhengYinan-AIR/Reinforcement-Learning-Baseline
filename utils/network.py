@@ -10,6 +10,10 @@ LOG_STD_MIN = -5
 LOG_STD_MAX = 2
 EPS = 1e-6
 
+def orthogonal_init(layer, gain=1.0):
+    nn.init.orthogonal_(layer.weight, gain=gain)
+    nn.init.constant_(layer.bias, 0)
+
 # CQL
 def extend_and_repeat(tensor, dim, repeat):
     # Extend and repeast the tensor along dim axie and repeat it
@@ -18,7 +22,7 @@ def extend_and_repeat(tensor, dim, repeat):
     return torch.unsqueeze(tensor, dim) * tensor.new_ones(ones_shape)
 
 class Actor(nn.Module):
-    def __init__(self, num_state, num_action, num_hidden, device):
+    def __init__(self, num_state, num_action, num_hidden, device, use_tanh=False, use_orthogonal=True):
         """
         Stochastic Actor network
         :param num_state: dimension of the state
@@ -32,14 +36,22 @@ class Actor(nn.Module):
         self.fc2 = nn.Linear(num_hidden, num_hidden)
         self.mu_head = nn.Linear(num_hidden, num_action)
         self.sigma_head = nn.Linear(num_hidden, num_action)
+        self.activate_func = [nn.ReLU(), nn.Tanh()][use_tanh]  # tanh is suitable for ppo
+
+        if use_orthogonal:
+            orthogonal_init(self.fc1)
+            orthogonal_init(self.fc2)
+            orthogonal_init(self.mu_head, gain=0.01)
+            orthogonal_init(self.sigma_head, gain=0.01)
+
 
     def forward(self, x, repeat=None):
         if repeat is not None:
             x = extend_and_repeat(x, 1, repeat)
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float).to(self.device)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
         mu = self.mu_head(x)
         log_sigma = self.sigma_head(x)
 
@@ -69,8 +81,8 @@ class Actor(nn.Module):
             x = torch.tensor(x, dtype=torch.float).to(self.device)
         if isinstance(y, np.ndarray):
             y = torch.tensor(y, dtype=torch.float).to(self.device)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
         mu = self.mu_head(x)
         log_sigma = self.sigma_head(x)
 
@@ -86,6 +98,21 @@ class Actor(nn.Module):
         logp_pi -= (2 * (np.log(2) - y - F.softplus(-2 * y))).sum(axis=1)
         logp_pi = torch.unsqueeze(logp_pi, dim=1)
         return logp_pi
+    
+    def get_distribution(self, x):
+        if isinstance(x, np.ndarray):
+            x = torch.tensor(x, dtype=torch.float).to(self.device)
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
+        mu = self.mu_head(x)
+        log_sigma = self.sigma_head(x)
+        mu = torch.clamp(mu, MEAN_MIN, MEAN_MAX)
+        log_sigma = torch.clamp(log_sigma, LOG_STD_MIN, LOG_STD_MAX)
+        sigma = torch.exp(log_sigma)
+
+        a_distribution = Normal(mu, sigma)
+
+        return a_distribution
 
     def get_action(self, x):
         """
@@ -95,8 +122,8 @@ class Actor(nn.Module):
         """
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float).to(self.device)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
         mu = self.mu_head(x)
         log_sigma = self.sigma_head(x)
 
@@ -111,15 +138,15 @@ class Actor(nn.Module):
     def get_deterministic_action(self, x):
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float).to(self.device)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
         mu = self.mu_head(x)
         mu = torch.clamp(mu, MEAN_MIN, MEAN_MAX)
         mu = torch.tanh(mu)
         return mu
 
 class Double_Critic(nn.Module):
-    def __init__(self, num_state, num_action, num_hidden, device, softplus=False):
+    def __init__(self, num_state, num_action, num_hidden, device, softplus=False, use_tanh=False, use_orthogonal=True):
         super(Double_Critic, self).__init__()
         self.device = device
         self.softplus = softplus
@@ -133,6 +160,15 @@ class Double_Critic(nn.Module):
         self.fc4 = nn.Linear(num_state + num_action, num_hidden)
         self.fc5 = nn.Linear(num_hidden, num_hidden)
         self.fc6 = nn.Linear(num_hidden, 1)
+        self.activate_func = [nn.ReLU(), nn.Tanh()][use_tanh]  # tanh is suitable for ppo
+
+        if use_orthogonal:
+            orthogonal_init(self.fc1)
+            orthogonal_init(self.fc2)
+            orthogonal_init(self.fc3)
+            orthogonal_init(self.fc4)
+            orthogonal_init(self.fc5)
+            orthogonal_init(self.fc6)
 
     def forward(self, obs, action):
         if isinstance(obs, np.ndarray):
@@ -141,15 +177,15 @@ class Double_Critic(nn.Module):
             action = torch.tensor(action, dtype=torch.float).to(self.device)
         x = torch.cat([obs, action], dim=-1)
 
-        q1 = F.relu(self.fc1(x))
-        q1 = F.relu(self.fc2(q1))
+        q1 = self.activate_func(self.fc1(x))
+        q1 = self.activate_func(self.fc2(q1))
         if self.softplus:
             q1 = F.softplus(self.fc3(q1))
         else:
             q1 = self.fc3(q1)
 
-        q2 = F.relu(self.fc4(x))
-        q2 = F.relu(self.fc5(q2))
+        q2 = self.activate_func(self.fc4(x))
+        q2 = self.activate_func(self.fc5(q2))
         if self.softplus:
             q2 = F.softplus(self.fc6(q2))
         else:
@@ -170,8 +206,8 @@ class Double_Critic(nn.Module):
             action = action.reshape(-1, action.shape[-1])
 
         x = torch.cat([obs, action], dim=-1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
         if self.softplus:
             q1 = F.softplus(self.fc3(x))
         else:
@@ -194,8 +230,8 @@ class Double_Critic(nn.Module):
             action = action.reshape(-1, action.shape[-1])
 
         x = torch.cat([obs, action], dim=-1)
-        x = F.relu(self.fc4(x))
-        x = F.relu(self.fc5(x))
+        x = self.activate_func(self.fc4(x))
+        x = self.activate_func(self.fc5(x))
         if self.softplus:
             q2 = F.softplus(self.fc6(x))
         else:
@@ -206,7 +242,7 @@ class Double_Critic(nn.Module):
 
 
 class V_critic(nn.Module):
-    def __init__(self, num_state, num_hidden, device, softplus=False):
+    def __init__(self, num_state, num_hidden, device, softplus=False, use_tanh=False, use_orthogonal=True):
         super(V_critic, self).__init__()
         self.device = device
         self.softplus = softplus
@@ -214,12 +250,19 @@ class V_critic(nn.Module):
         self.fc1 = nn.Linear(num_state, num_hidden)
         self.fc2 = nn.Linear(num_hidden, num_hidden)
         self.state_value = nn.Linear(num_hidden, 1)
+        self.activate_func = [nn.ReLU(), nn.Tanh()][use_tanh]  # tanh is suitable for ppo
+
+        if use_orthogonal:
+            orthogonal_init(self.fc1)
+            orthogonal_init(self.fc2)
+            orthogonal_init(self.state_value)
+
 
     def forward(self, x):
         if isinstance(x, np.ndarray):
             x = torch.tensor(x, dtype=torch.float).to(self.device)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
         if self.softplus:
             v = F.softplus(self.state_value(x))
         else:
@@ -228,7 +271,7 @@ class V_critic(nn.Module):
 
 
 class Q_critic(nn.Module):
-    def __init__(self, num_state, num_action, num_hidden, device, softplus=False):
+    def __init__(self, num_state, num_action, num_hidden, device, softplus=False, use_tanh=False, use_orthogonal=True):
         super(Q_critic, self).__init__()
         self.device = device
         self.softplus = softplus
@@ -236,6 +279,13 @@ class Q_critic(nn.Module):
         self.fc1 = nn.Linear(num_state + num_action, num_hidden)
         self.fc2 = nn.Linear(num_hidden, num_hidden)
         self.state_value = nn.Linear(num_hidden, 1)
+        self.activate_func = [nn.ReLU(), nn.Tanh()][use_tanh]  # tanh is suitable for ppo
+
+        if use_orthogonal:
+            orthogonal_init(self.fc1)
+            orthogonal_init(self.fc2)
+            orthogonal_init(self.state_value)
+
 
     def forward(self, obs, action):
         if isinstance(obs, np.ndarray):
@@ -251,8 +301,8 @@ class Q_critic(nn.Module):
             action = action.reshape(-1, action.shape[-1])
 
         x = torch.cat([obs, action], dim=-1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
         if self.softplus:
             q1 = F.softplus(self.state_value(x))
         else:

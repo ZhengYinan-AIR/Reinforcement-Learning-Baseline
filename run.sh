@@ -1,0 +1,1 @@
+python run.py --environment=gym --robot=Hopper-v2 --algo=PPO --buffer_size=2048 --batch_size=64 --total_iterations=3e6

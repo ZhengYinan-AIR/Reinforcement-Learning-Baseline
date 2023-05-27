@@ -2,13 +2,12 @@ import argparse
 import os
 import os.path as osp
 import time
-import torch
-import pickle
 import numpy as np
 import json
-from PIL import Image
 
-DEFAULT_DATA_DIR = osp.join(osp.dirname(__file__),'result')
+
+utils_dir = os.path.abspath(os.path.join(osp.dirname(__file__), "../"))
+DEFAULT_DATA_DIR = osp.join(utils_dir,'result')
 
 class RunningMeanStd:
     # Dynamically calculate mean and std

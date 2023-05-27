@@ -65,7 +65,7 @@ class Actor(nn.Module):
         logp_pi = a_distribution.log_prob(action).sum(axis=-1)
 
         logp_pi -= (2 * (np.log(2) - action - F.softplus(-2 * action))).sum(axis=-1)
-        logp_pi = torch.unsqueeze(logp_pi, dim=1)
+        logp_pi = torch.unsqueeze(logp_pi, dim=-1)
 
         action = torch.tanh(action)
         return action, logp_pi
@@ -95,8 +95,8 @@ class Actor(nn.Module):
 
         a_distribution = Normal(mu, sigma)
         logp_pi = a_distribution.log_prob(y).sum(axis=-1)
-        logp_pi -= (2 * (np.log(2) - y - F.softplus(-2 * y))).sum(axis=1)
-        logp_pi = torch.unsqueeze(logp_pi, dim=1)
+        logp_pi -= (2 * (np.log(2) - y - F.softplus(-2 * y))).sum(axis=-1)
+        logp_pi = torch.unsqueeze(logp_pi, dim=-1)
         return logp_pi
     
     def get_distribution(self, x):

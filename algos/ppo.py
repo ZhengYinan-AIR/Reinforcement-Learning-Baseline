@@ -15,24 +15,31 @@ class PPO(object):
         self._epsilon = config['epsilon']
         self._entropy_coef = config['entropy_coef']
         self._gamma = config['gamma']
-        self._tau = config['tau']
         self._hidden_sizes = config['hidden_sizes']
         self._batch_size = config['batch_size']
         self._lr = config['lr']
         self._actor_lr = config['actor_lr']
-        self._grad_norm_clip = config['grad_norm_clip']
 
+        self._max_train_steps = config['max_train_steps']
+
+        self._use_adv_norm = config['use_adv_norm']
+        self._use_grad_clip = config['use_grad_clip']
+        self._use_lr_decay = config['use_lr_decay']
         self._device = config['device']
 
-        self._critic_network = V_critic(observation_spec, action_spec, self._hidden_sizes, self._device, use_tanh=True).to(self._device)
-        self._critic_optimizer = torch.optim.Adam(self._critic_network.parameters(), self._lr)
-        # policy-network
-        self._policy_network = Actor(observation_spec, action_spec, self._hidden_sizes, self._device, use_tanh=True).to(self._device)
-        self._policy_optimizer = torch.optim.Adam(self._policy_network.parameters(), self._actor_lr)
+        self._critic_network = V_critic(observation_spec, action_spec, self._hidden_sizes, self._device, 
+                                        use_tanh=config['use_tanh'], use_orthogonal=config['use_orthogonal_init']).to(self._device)
+        self._policy_network = Actor(observation_spec, action_spec, self._hidden_sizes, self._device, 
+                                     use_tanh=config['use_tanh'], use_orthogonal=config['use_orthogonal_init']).to(self._device)
+        
+        if config['set_adam_eps']:
+            self._critic_optimizer = torch.optim.Adam(self._critic_network.parameters(), self._lr, eps=1e-5)
+            self._policy_optimizer = torch.optim.Adam(self._policy_network.parameters(), self._actor_lr, eps=1e-5)
+        else:
+            self._critic_optimizer = torch.optim.Adam(self._critic_network.parameters(), self._lr)
+            self._policy_optimizer = torch.optim.Adam(self._policy_network.parameters(), self._actor_lr)
 
-        self._num_training = 1
-
-    def update(self, replay_buffer):
+    def update(self, replay_buffer, total_steps):
         result = {}
 
         s, a, a_logprob, r, s_, dw, done = replay_buffer.numpy_to_tensor()  # Get training data
@@ -47,14 +54,14 @@ class PPO(object):
             vs = self._critic_network(s)
             vs_ = self._critic_network(s_)
             deltas = r + self._gamma * (1.0 - dw) * vs_ - vs
-            for delta, d in zip(reversed(deltas.flatten().numpy()), reversed(done.flatten().numpy())):
+            for delta, d in zip(reversed(deltas.flatten().cpu().numpy()), reversed(done.flatten().cpu().numpy())):
                 gae = delta + self._gamma * self._lamda * gae * (1.0 - d)
                 adv.insert(0, gae)
-            adv = torch.tensor(adv, dtype=torch.float).view(-1, 1)
+            adv = torch.tensor(adv, dtype=torch.float).view(-1, 1).to(self._device)
             v_target = adv + vs
-            
             # advantage normalization
-            adv = ((adv - adv.mean()) / (adv.std() + 1e-5))
+            if self._use_adv_norm:
+                adv = ((adv - adv.mean()) / (adv.std() + 1e-5))
 
         # Optimize policy for K epochs:
         for _ in range(self._K_epochs):
@@ -62,18 +69,19 @@ class PPO(object):
             for index in BatchSampler(SubsetRandomSampler(range(replay_buffer.size)), self._batch_size, False):
                 dist_now = self._policy_network.get_distribution(s[index])
                 dist_entropy = dist_now.entropy().sum(1, keepdim=True)  # shape(mini_batch_size X 1)
-                a_logprob_now = dist_now.log_prob(a[index])
+                a_logprob_now = self._policy_network.get_log_density(s[index], a[index])
                 # a/b=exp(log(a)-log(b))  In multi-dimensional continuous action space，we need to sum up the log_prob
                 ratios = torch.exp(a_logprob_now.sum(1, keepdim=True) - a_logprob[index].sum(1, keepdim=True))  # shape(mini_batch_size X 1)
 
                 surr1 = ratios * adv[index]  # Only calculate the gradient of 'a_logprob_now' in ratios
                 surr2 = torch.clamp(ratios, 1 - self._epsilon, 1 + self._epsilon) * adv[index]
-                actor_loss = -torch.min(surr1, surr2) - self._entropy_coef * dist_entropy  # Trick 5: policy entropy
+                actor_loss = torch.mean(-torch.min(surr1, surr2) - self._entropy_coef * dist_entropy)  # Trick 5: policy entropy
 
                 # Update actor
                 self._policy_optimizer.zero_grad()
-                actor_loss.mean().backward()
-                torch.nn.utils.clip_grad_norm_(self._policy_network.parameters(), 0.5)
+                actor_loss.backward()
+                if self._use_grad_clip:
+                    torch.nn.utils.clip_grad_norm_(self._policy_network.parameters(), 0.5)
                 self._policy_optimizer.step()
 
                 v_s = self._critic_network(s[index])
@@ -81,85 +89,47 @@ class PPO(object):
                 # Update critic
                 self._critic_optimizer.zero_grad()
                 critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self._critic_network.parameters(), 0.5)
+                if self._use_grad_clip:
+                    torch.nn.utils.clip_grad_norm_(self._critic_network.parameters(), 0.5)
                 self._critic_optimizer.step()
 
-        if self.use_lr_decay:  # Trick 6:learning rate Decay
+        if self._use_lr_decay:  # Trick 6:learning rate Decay
             self.lr_decay(total_steps)
 
-
-        # Monte Carlo estimate of returns
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(self._buffer.rewards), reversed(self.buffer._is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self._gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
-            
-        # Normalizing the rewards
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self._device)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
-
-        # convert list to tensor
-        old_states = torch.squeeze(torch.stack(self._buffer.states, dim=0)).detach().to(self._device)
-        old_actions = torch.squeeze(torch.stack(self._buffer.actions, dim=0)).detach().to(self._device)
-        old_logprobs = torch.squeeze(torch.stack(self._buffer.logprobs, dim=0)).detach().to(self._device)
-        old_state_values = torch.squeeze(torch.stack(self._buffer.state_values, dim=0)).detach().to(self._device)
-
-        # calculate advantages
-        advantages = rewards.detach() - old_state_values.detach()
-
-        # Optimize policy for K epochs
-        for _ in range(self._K_epochs):
-
-            # Evaluating old actions and values
-            logprobs = self._policy_network.get_log_density(old_states, old_actions)
-            state_values = self._critic_network(old_states)
-
-            # Finding the ratio (pi_theta / pi_theta__old)
-            ratios = torch.exp(logprobs - old_logprobs.detach())
-
-            # Finding Surrogate Loss  
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
-
-            # final loss of clipped objective PPO
-            policy_loss = -torch.min(surr1, surr2)
-            critic_loss = F.mse_loss(state_values, rewards)
-
-            self._optimizers['policy'].zero_grad()
-            policy_loss.backward()
-            self._optimizers['policy'].step()
-
-            self._optimizers['critic'].zero_grad()
-            critic_loss.backward()
-            self._optimizers['critic'].step()
-
-        # Copy new weights into old policy
-        self._old_policy_network.load_state_dict(self._policy_network.state_dict())
-
         result.update({
-            'policy_loss': policy_loss,
+            'policy_loss': actor_loss,
             'critic_loss': critic_loss,
-            'state_values': state_values.detach().mean(),
+            'state_values': v_s.detach().mean(),
+            'state_target_values': v_target.detach().mean(),
+            'reward': r.detach().mean()
         })
         return result
+    
+    def lr_decay(self, total_steps):
+        actor_lr_now = self._actor_lr * (1 - total_steps / self._max_train_steps)
+        lr_now = self._lr * (1 - total_steps / self._max_train_steps)
+        for p in self._policy_optimizer.param_groups:
+            p['lr'] = actor_lr_now
+        for p in self._critic_optimizer.param_groups:
+            p['lr'] = lr_now
 
     def step(self, o):
         o = torch.from_numpy(o).float().to(self._device)
         action = self._policy_network.get_action(o)
 
         return action.detach().cpu().numpy()
+    
+    def choose_action(self, o):
+        o = torch.from_numpy(o).float().to(self._device)
+        action, log_prob = self._policy_network(o)
+
+        return action.detach().cpu().numpy(), log_prob.detach().cpu().numpy()
 
     def save(self, filedir):
-        modeldir = os.path.join(filedir, 'model')
-        os.makedirs(modeldir)
-
-        torch.save(self._policy_network.state_dict(), os.path.join(modeldir, 'policy_network.pth'))
+        torch.save(self._policy_network.state_dict(), os.path.join(filedir, 'policy_network.pth'))
         # torch.save(self._optimizers['policy'].state_dict(), os.path.join(modeldir, 'policy_network_optimizer.pth'))
 
     def load(self, filedir):
-        modeldir = os.path.join(filedir, 'model')
+        modeldir = filedir
         self._policy_network.load_state_dict(torch.load(os.path.join(modeldir, 'policy_network.pth')))
-        self._optimizers['policy'] = torch.optim.Adam(self._policy_network.parameters(), self._lr)
+        # self._optimizers['policy'] = torch.optim.Adam(self._policy_network.parameters(), self._lr)

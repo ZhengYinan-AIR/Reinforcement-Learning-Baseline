@@ -240,11 +240,17 @@ def run(config):
     env_list = ['point', 'car']
     env_name = config['env_name']
     assert env_name in env_list, "Invalid Env"
+    if config['violation_done']:
+        env = SafetyGymWrapper(
+            robot_type=env_name,
+            id=None,    # train: done on violation; eval: false
+        )
+    else:
+        env = SafetyGymWrapper(
+            robot_type=env_name,
+            id=1,    # train: done on violation; eval: false
+        )
 
-    env = SafetyGymWrapper(
-        robot_type=env_name,
-        id=None,    # train: done on violation; eval: false
-    )
     env_evaluate = SafetyGymWrapper(
         robot_type=env_name,
         id=1,    # train: done on violation; eval: false
@@ -303,21 +309,14 @@ def run(config):
             else:
                 a = agent.choose_action(s)
             s_, r, done, info = env.step(a)
-
-            info_keys = info.keys()
-            goal_met = ('goal_met' in info_keys)
-            done = done or goal_met # collision not done, reach goal done and terminal done
+            if config['goal_met_done']:
+                info_keys = info.keys()
+                goal_met = ('goal_met' in info_keys)
+                done = done or goal_met # collision not done, reach goal done and terminal done
             c = info['violation']
             cv = torch.tensor(info['constraint_value'], dtype=torch.float)
 
-            # When dead or win or reaching the max_episode_steps, done will be Ture, we need to distinguish them;
-            # dw means dead or win,there is no next state s';
-            # but when reaching the max_episode_steps,there is a next state s' actually.
-            if done and episode_steps != max_episode_steps:
-                dw = True
-            else:
-                dw = False
-            replay_buffer.store(s, a, r, s_, dw, c, cv)  # Store the transition
+            replay_buffer.store(s, a, r, s_, done, c, cv)  # Store the transition
             s = s_
 
             if total_steps >= config['random_steps']:
@@ -352,16 +351,14 @@ def run(config):
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', default='SAC', type=str)
-
     parser.add_argument('--env_name', default='point', type=str)
-
     parser.add_argument('--device', default='cuda:0', type=str)
     parser.add_argument('--wandb', default=False, type=boolean)
     parser.add_argument('--seed', default=0, type=int)
 
     parser.add_argument('--max_train_steps', default=int(3e6), type=int)
     parser.add_argument('--evaluate_freq', default=int(5e3), type=int)
-    parser.add_argument('--random_steps', default=int(25e3), type=int)
+    parser.add_argument('--random_steps', default=int(5e3), type=int)
 
     parser.add_argument('--gamma', default=0.99, type=float)
     parser.add_argument('--alpha', default=5.0, type=float)
@@ -371,6 +368,10 @@ def get_parser():
     parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--lr', default=3e-4, type=float)
     parser.add_argument('--actor_lr', default=3e-5, type=float)
+
+    parser.add_argument('--goal_met_done', default=False, type=boolean)
+    parser.add_argument('--violation_done', default=False, type=boolean)
+
 
     return parser
 

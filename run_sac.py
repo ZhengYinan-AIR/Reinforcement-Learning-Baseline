@@ -1,5 +1,6 @@
 import os
 import gym
+import safety_gym
 import torch
 import argparse
 import torch.nn as nn
@@ -200,7 +201,8 @@ class SAC(object):
             'alpha_loss': alpha_loss,
             'alpha': self.log_alpha.exp().detach().mean(),
             'current_q': current_Q1.detach().mean(),
-            'target_q': target_Q.detach().mean()
+            'target_q': target_Q.detach().mean(),
+            'r': batch_r.detach().mean()
         })
         return result
     
@@ -211,7 +213,7 @@ class SAC(object):
         self.actor.load_state_dict(torch.load(os.path.join(filedir, 'policy_network.pth')))
 
 
-def evaluate_policy(env, agent):
+def evaluate_policy(env, agent, env_name):
     times = 10  # Perform evaluations and calculate the average
     evaluate_reward = 0
     evaluate_cost = 0
@@ -223,9 +225,11 @@ def evaluate_policy(env, agent):
         while not done:
             a = agent.choose_action(s, deterministic=True)  # We use the deterministic policy during the evaluating
             s_, r, done, info = env.step(a)
-
-            c = info['violation']
-
+            if env_name == 'simple_sg':
+                c = info['violation']
+            elif env_name == 'safety_gym':
+                c = info['cost']
+        
             episode_reward += r
             episode_cost += c
 
@@ -236,25 +240,42 @@ def evaluate_policy(env, agent):
     return int(evaluate_reward / times), int(evaluate_cost / times)
 
 def run(config):
-    
-    env_list = ['point', 'car']
-    env_name = config['env_name']
-    assert env_name in env_list, "Invalid Env"
-    if config['violation_done']:
-        env = SafetyGymWrapper(
-            robot_type=env_name,
-            id=None,    # train: done on violation; eval: false
-        )
-    else:
-        env = SafetyGymWrapper(
+    if config['environment'] == 'simple_sg':
+        env_list = ['point', 'car']
+        env_name = config['env_name']
+        assert env_name in env_list, "Invalid Env"
+        if config['violation_done']:
+            env = SafetyGymWrapper(
+                robot_type=env_name,
+                id=None,    # train: done on violation; eval: false
+            )
+        else:
+            env = SafetyGymWrapper(
+                robot_type=env_name,
+                id=1,    # train: done on violation; eval: false
+            )
+
+        env_evaluate = SafetyGymWrapper(
             robot_type=env_name,
             id=1,    # train: done on violation; eval: false
         )
+        exp_name = config['algo'] + '_' + env_name
 
-    env_evaluate = SafetyGymWrapper(
-        robot_type=env_name,
-        id=1,    # train: done on violation; eval: false
-    )
+    elif config['environment'] == 'safety_gym':
+        # Verify experiment
+        robot_list = ['Point', 'Car', 'Doggo']
+        task_list = ['Goal1', 'Goal2', 'Button1', 'Button2', 'Push1', 'Push2']
+        algo = config['algo']
+        task = config['task']
+        robot = config['robot']
+        assert task in task_list, "Invalid task"
+        assert robot in robot_list, "Invalid robot"
+        exp_name = algo + '_' + robot + task
+
+        env_name = 'Safexp-' + robot + task + '-v0'
+    
+        env = gym.make(env_name)
+        env_evaluate = gym.make(env_name)
 
     seed = config['seed']
     # Set random seed
@@ -268,7 +289,10 @@ def run(config):
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
-    max_episode_steps = env._max_episode_steps  # Maximum number of steps per episode
+    if config['environment'] == 'safety_gym':
+        max_episode_steps = 1000
+    else:
+        max_episode_steps = env._max_episode_steps  # Maximum number of steps per episode
     print("env={}".format(env_name))
     print("state_dim={}".format(state_dim))
     print("action_dim={}".format(action_dim))
@@ -281,7 +305,7 @@ def run(config):
         'max_episode_steps': max_episode_steps
     })
 
-    exp_name = config['algo'] + '_' + env_name
+    
     if config['wandb'] == True:
         wandb.init(project=exp_name, name='test_s'+str(config['seed']), reinit=True, mode='online')
 
@@ -313,8 +337,13 @@ def run(config):
                 info_keys = info.keys()
                 goal_met = ('goal_met' in info_keys)
                 done = done or goal_met # collision not done, reach goal done and terminal done
-            c = info['violation']
-            cv = torch.tensor(info['constraint_value'], dtype=torch.float)
+            
+            if config['environment'] == 'safety_gym':
+                c = info['cost']
+                cv = c
+            else:
+                c = info['violation']
+                cv = torch.tensor(info['constraint_value'], dtype=torch.float)
 
             replay_buffer.store(s, a, r, s_, done, c, cv)  # Store the transition
             s = s_
@@ -325,7 +354,7 @@ def run(config):
             # Evaluate the policy every 'evaluate_freq' steps
             if total_steps % config['evaluate_freq'] == 0:
                 evaluate_num += 1
-                evaluate_reward, evaluate_cost = evaluate_policy(env_evaluate, agent)
+                evaluate_reward, evaluate_cost = evaluate_policy(env_evaluate, agent, config['environment'])
                 result.update({'ep_r': evaluate_reward, 'ep_c': evaluate_cost})
                 for k, v in sorted(result.items()):
                     print(f'- {k:23s}:{v:15.10f}')
@@ -341,7 +370,7 @@ def run(config):
 
             total_steps += 1
 
-            #print(total_steps)
+        print('one episode finish, episode_steps={}'.format(episode_steps))
 
     # Save model
     dir = logger.get_dir()
@@ -351,6 +380,9 @@ def run(config):
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', default='SAC', type=str)
+    parser.add_argument('--environment', default='safety_gym', type=str) # simple_sg or safety_gym
+    parser.add_argument('--robot', default='Point', type=str)
+    parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
     parser.add_argument('--device', default='cuda:0', type=str)
     parser.add_argument('--wandb', default=False, type=boolean)
@@ -361,7 +393,6 @@ def get_parser():
     parser.add_argument('--random_steps', default=int(5e3), type=int)
 
     parser.add_argument('--gamma', default=0.99, type=float)
-    parser.add_argument('--alpha', default=5.0, type=float)
     parser.add_argument('--tau', default=0.005, type=float)
     parser.add_argument('--adaptive_alpha', default=True, type=boolean)
     parser.add_argument('--hidden_sizes', default=256)

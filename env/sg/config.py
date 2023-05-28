@@ -1,17 +1,13 @@
 from pathlib import Path
 import sys
+import os.path as osp
 
-from src.defaults import ROOT_DIR
-ROOT_DIR = Path(ROOT_DIR)
-
-assert ROOT_DIR.is_dir(), ROOT_DIR
-
-XML_DIR = ROOT_DIR / 'src' / 'env' / 'sg' / 'xmls'
+XML_DIR = osp.join(osp.dirname(__file__),'xmls')
 
 point_goal_config = {
     'num_steps': 1000,
 
-    'robot_base': str(XML_DIR / 'point.xml'),
+    'robot_base': str(osp.join(XML_DIR, 'point.xml')),
 
     'task': 'goal',
 
@@ -38,12 +34,12 @@ car_goal_config = {
     **point_goal_config,
     'num_steps': 1000,
     'frameskip_binom_n': 10,
-    'robot_base': str(XML_DIR / 'car.xml'),
+    'robot_base': str(osp.join(XML_DIR, 'car.xml')),
 }
 
 doggo_goal_config = {
     **point_goal_config,
-    'robot_base': str(XML_DIR / 'doggo.xml'),
+    'robot_base': str(osp.join(XML_DIR, 'doggo.xml')),
     'sensors_obs': 
         ['accelerometer', 'velocimeter', 'gyro', 'magnetometer'] +
         [

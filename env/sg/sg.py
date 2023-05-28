@@ -7,8 +7,8 @@ import numpy as np
 import gym
 from gym import Wrapper
 
-from src.env.sg.simple_safety_gym import SimpleEngine
-from src.env.sg.config import *
+from env.sg.simple_safety_gym import SimpleEngine
+from env.sg.config import *
 
 
 class SafetyGymWrapper(Wrapper):

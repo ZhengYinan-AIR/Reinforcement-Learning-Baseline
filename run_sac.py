@@ -9,6 +9,7 @@ import copy
 from torch.distributions import Normal
 import utils
 from utils import boolean
+from env.sg.sg import SafetyGymWrapper
 
 import wandb
 
@@ -82,13 +83,17 @@ class ReplayBuffer(object):
         self.r = np.zeros((self.max_size, 1))
         self.s_ = np.zeros((self.max_size, state_dim))
         self.dw = np.zeros((self.max_size, 1))
+        self.c = np.zeros((self.max_size, 1)) # cost
+        self.cv = np.zeros((self.max_size, 1)) # constraint violation
 
-    def store(self, s, a, r, s_, dw):
+    def store(self, s, a, r, s_, dw, c, cv):
         self.s[self.count] = s
         self.a[self.count] = a
         self.r[self.count] = r
         self.s_[self.count] = s_
         self.dw[self.count] = dw
+        self.c[self.count] = c
+        self.cv[self.count] = cv
         self.count = (self.count + 1) % self.max_size  # When the 'count' reaches max_size, it will be reset to 0.
         self.size = min(self.size + 1, self.max_size)  # Record the number of  transitions
 
@@ -99,8 +104,10 @@ class ReplayBuffer(object):
         batch_r = torch.tensor(self.r[index], dtype=torch.float).to(self.device)
         batch_s_ = torch.tensor(self.s_[index], dtype=torch.float).to(self.device)
         batch_dw = torch.tensor(self.dw[index], dtype=torch.float).to(self.device)
+        batch_c = torch.tensor(self.c[index], dtype=torch.float).to(self.device)
+        batch_cv = torch.tensor(self.cv[index], dtype=torch.float).to(self.device)
 
-        return batch_s, batch_a, batch_r, batch_s_, batch_dw
+        return batch_s, batch_a, batch_r, batch_s_, batch_dw, batch_c, batch_cv
 
 
 class SAC(object):
@@ -138,7 +145,7 @@ class SAC(object):
 
     def learn(self, relay_buffer):
         result = {}
-        batch_s, batch_a, batch_r, batch_s_, batch_dw = relay_buffer.sample(self.batch_size)  # Sample a batch
+        batch_s, batch_a, batch_r, batch_s_, batch_dw, batch_c, batch_cv = relay_buffer.sample(self.batch_size)  # Sample a batch
 
         with torch.no_grad():
             batch_a_, log_pi_ = self.actor(batch_s_)  # a' from the current policy
@@ -205,28 +212,43 @@ class SAC(object):
 
 
 def evaluate_policy(env, agent):
-    times = 3  # Perform three evaluations and calculate the average
+    times = 10  # Perform evaluations and calculate the average
     evaluate_reward = 0
+    evaluate_cost = 0
     for _ in range(times):
         s = env.reset()
         done = False
         episode_reward = 0
+        episode_cost = 0
         while not done:
             a = agent.choose_action(s, deterministic=True)  # We use the deterministic policy during the evaluating
-            s_, r, done, _ = env.step(a)
+            s_, r, done, info = env.step(a)
+
+            c = info['violation']
+
             episode_reward += r
+            episode_cost += c
+
             s = s_
         evaluate_reward += episode_reward
+        evaluate_cost += episode_cost
 
-    return int(evaluate_reward / times)
+    return int(evaluate_reward / times), int(evaluate_cost / times)
 
 def run(config):
-    env_list = ['HalfCheetah-v2', 'Hopper-v2', 'Walker2d-v2']
+    
+    env_list = ['point', 'car']
     env_name = config['env_name']
     assert env_name in env_list, "Invalid Env"
 
-    env = gym.make(env_name)
-    env_evaluate = gym.make(env_name)  # When evaluating the policy, we need to rebuild an environment
+    env = SafetyGymWrapper(
+        robot_type=env_name,
+        id=None,    # train: done on violation; eval: false
+    )
+    env_evaluate = SafetyGymWrapper(
+        robot_type=env_name,
+        id=1,    # train: done on violation; eval: false
+    )
 
     seed = config['seed']
     # Set random seed
@@ -280,7 +302,13 @@ def run(config):
                 a = env.action_space.sample()
             else:
                 a = agent.choose_action(s)
-            s_, r, done, _ = env.step(a)
+            s_, r, done, info = env.step(a)
+
+            info_keys = info.keys()
+            goal_met = ('goal_met' in info_keys)
+            done = done or goal_met # collision not done, reach goal done and terminal done
+            c = info['violation']
+            cv = torch.tensor(info['constraint_value'], dtype=torch.float)
 
             # When dead or win or reaching the max_episode_steps, done will be Ture, we need to distinguish them;
             # dw means dead or win,there is no next state s';
@@ -289,7 +317,7 @@ def run(config):
                 dw = True
             else:
                 dw = False
-            replay_buffer.store(s, a, r, s_, dw)  # Store the transition
+            replay_buffer.store(s, a, r, s_, dw, c, cv)  # Store the transition
             s = s_
 
             if total_steps >= config['random_steps']:
@@ -298,8 +326,8 @@ def run(config):
             # Evaluate the policy every 'evaluate_freq' steps
             if total_steps % config['evaluate_freq'] == 0:
                 evaluate_num += 1
-                evaluate_reward = evaluate_policy(env_evaluate, agent)
-                result.update({'ep_r': evaluate_reward})
+                evaluate_reward, evaluate_cost = evaluate_policy(env_evaluate, agent)
+                result.update({'ep_r': evaluate_reward, 'ep_c': evaluate_cost})
                 for k, v in sorted(result.items()):
                     print(f'- {k:23s}:{v:15.10f}')
                 print(f'iteration={total_steps}')
@@ -324,9 +352,11 @@ def run(config):
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', default='SAC', type=str)
-    parser.add_argument('--env_name', default='Hopper-v2', type=str)
+
+    parser.add_argument('--env_name', default='point', type=str)
+
     parser.add_argument('--device', default='cuda:0', type=str)
-    parser.add_argument('--wandb', default=True, type=boolean)
+    parser.add_argument('--wandb', default=False, type=boolean)
     parser.add_argument('--seed', default=0, type=int)
 
     parser.add_argument('--max_train_steps', default=int(3e6), type=int)

@@ -180,6 +180,18 @@ class SAC(object):
         a, _ = self.actor(s, deterministic, False)  # When choosing actions, we do not need to compute log_pi
         return a.cpu().data.numpy().flatten()
 
+    def cancel_grad(self, net):
+        for params in net.parameters():
+            params.requires_grad = False
+
+    def use_grad(self, net):
+        for params in net.parameters():
+            params.requires_grad = True
+
+    def soft_update(self, net, target_net):
+        for param, target_param in zip(net.parameters(), target_net.parameters()):
+            target_param.data.copy_(self.TAU * param.data + (1 - self.TAU) * target_param.data)
+
     def update_critic(self, batch_s, batch_a, batch_r, batch_s_, batch_dw, result):
         with torch.no_grad():
             batch_a_, log_pi_ = self.actor(batch_s_)  # a' from the current policy
@@ -234,8 +246,7 @@ class SAC(object):
 
         if self.num_update % self.actor_update_interval == 0:
             # Freeze critic networks so you don't waste computational effort
-            for params in self.critic.parameters():
-                params.requires_grad = False
+            self.cancel_grad(self.critic)
 
             result = self.update_actor(batch_s, result)
 
@@ -255,12 +266,10 @@ class SAC(object):
                 self.alpha = self.log_alpha().exp()
 
             # Unfreeze critic networks
-            for params in self.critic.parameters():
-                params.requires_grad = True
+            self.use_grad(self.critic)
 
         # Softly update target networks
-        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_param.data.copy_(self.TAU * param.data + (1 - self.TAU) * target_param.data)
+        self.soft_update(self.critic, self.critic_target)
 
         self.num_update += 1
 

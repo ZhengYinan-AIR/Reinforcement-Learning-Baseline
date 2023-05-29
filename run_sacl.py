@@ -47,40 +47,68 @@ class Cost_Critic(nn.Module):  # According to (s,a), directly calculate Q(s,a)
         
         return q1, q2
 
+class Scalar_Multiplier(nn.Module):
+    def __init__(self, init_value):
+        super().__init__()
+        self.init_value = init_value
+        self.constant = nn.Parameter(
+            torch.tensor(self.init_value, requires_grad=True)
+        )
 
+    def forward(self):
+        return F.softplus(self.constant)
+    
 class SACL(SAC):
     def __init__(self, state_dim, action_dim, max_action, config):
         super().__init__(state_dim, action_dim, max_action, config)
+
+        self.multiplier_update_interval = config['multiplier_update_interval']
+        self.multiplier_lr = config['multiplier_lr']
+        self.multiplier_lr_end = config['multiplier_lr_end']
+        self.cost_limit = config['cost_limit']
+        self.multiplier_ub = config['multiplier_ub'] # lambda upper bound
+        self.penalty_ub = config['penalty_ub']
+        self.penalty_lb = config['penalty_lb']
 
         self.cost_critic = Cost_Critic(state_dim, action_dim, self.hidden_width, use_softplus=config['use_softplus']).to(self.device)
         self.cost_critic_target = copy.deepcopy(self.cost_critic).to(self.device)
 
         self.cost_critic_optimizer = torch.optim.Adam(self.cost_critic.parameters(), lr=self.lr)
+        self.cost_critic_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.cost_critic_optimizer,
+            T_max=self.updates_per_training,
+            eta_min=self.lr_end
+        )
 
-    def choose_action(self, s, deterministic=False):
-        s = torch.unsqueeze(torch.tensor(s, dtype=torch.float), 0).to(self.device)
-        a, _ = self.actor(s, deterministic, False)  # When choosing actions, we do not need to compute log_pi
-        return a.cpu().data.numpy().flatten()
+        # multiplier
+        self.multiplier_updates_num = int(self.updates_per_training / self.multiplier_update_interval)
+        self.multiplier = Scalar_Multiplier(init_value=config['multiplier_init']).to(self.device)
+        self.multiplier_optimizer = torch.optim.Adam(self.multiplier.parameters(), lr=self.multiplier_lr)
+        self.multiplier_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.multiplier_optimizer,
+            T_max=self.multiplier_updates_num,
+            eta_min=self.multiplier_lr_end
+        )
 
-    def update_critic(self, batch_s, batch_a, batch_r, batch_s_, batch_dw, result):
+    def update_cost_critic(self, batch_s, batch_a, batch_s_, batch_dw, batch_c, result): # not need batch_r！
+
         with torch.no_grad():
             batch_a_, log_pi_ = self.actor(batch_s_)  # a' from the current policy
-            # Compute target Q
-            target_Q1, target_Q2 = self.critic_target(batch_s_, batch_a_)
-            target_Q = batch_r + self.GAMMA * (1 - batch_dw) * (torch.min(target_Q1, target_Q2) - self.alpha * log_pi_)
+            # Compute target Qc
+            target_Qc1, target_Qc2 = self.cost_critic_target(batch_s_, batch_a_)
+            target_Qc = batch_c + self.GAMMA * (1 - batch_dw) * torch.max(target_Qc1, target_Qc2) # qc use the torch.max
 
-        # Compute current Q
-        current_Q1, current_Q2 = self.critic(batch_s, batch_a)
-        # Compute critic loss
-        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+        # Compute current Qc
+        current_Qc1, current_Qc2 = self.cost_critic(batch_s, batch_a)
+        # Compute cost_critic loss
+        cost_critic_loss = F.mse_loss(current_Qc1, target_Qc) + F.mse_loss(current_Qc2, target_Qc)
 
         result.update({
-            'critic_loss': critic_loss,
-            'current_q': current_Q1.detach().mean(),
-            'target_q': target_Q.detach().mean(),
-            'r': batch_r.detach().mean(),
+            'cost_critic_loss': cost_critic_loss,
+            'current_qc': current_Qc1.detach().mean(),
+            'target_qc': target_Qc.detach().mean(),
+            'c': batch_c.detach().mean(),
         })
-
         return result
     
     def update_actor(self, batch_s, result):
@@ -89,24 +117,56 @@ class SACL(SAC):
         a, log_pi = self.actor(batch_s)
         Q1, Q2 = self.critic(batch_s, a)
         Q = torch.min(Q1, Q2)
-        actor_loss = (self.alpha * log_pi - Q).mean()
+        uncstr_actor_loss = (self.alpha * log_pi - Q).mean()
 
         # Compute alpha loss
         if self.adaptive_alpha:
             # We learn log_alpha instead of alpha to ensure that alpha=exp(log_alpha)>0
             alpha_loss = -(self.log_alpha().exp() * (log_pi + self.target_entropy).detach()).mean()
 
+        # Constrained part
+        Qc1, Qc2 = self.cost_critic(batch_s, a)
+        Qc= torch.max(Qc1, Qc2)
+        violation = Qc - self.cost_limit
+        violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
+
+        multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
+        cstr_actor_loss= torch.mean(multiplier.detach() * violation)
+
+        actor_loss = uncstr_actor_loss + cstr_actor_loss
+
         result.update({
+            'uncstr_actor_loss': uncstr_actor_loss,
+            'cstr_actor_loss': cstr_actor_loss,
             'actor_loss': actor_loss,
             'alpha_loss': alpha_loss,
             'alpha': self.log_alpha().exp().detach().mean(),
         })
-
         return result
+    
+    def update_multiplier(self, batch_s, result):
+        # Constrained part
+        a, _ = self.actor(batch_s)
+        Qc1, Qc2 = self.cost_critic(batch_s, a)
+        Qc= torch.max(Qc1, Qc2)
+        violation = Qc - self.cost_limit
+        violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
 
+        multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
+
+        multiplier_loss = -torch.mean(multiplier * violation.detach()) 
+
+        result.update({
+            'multiplier_loss': multiplier_loss,
+            'multiplier': multiplier.detach().mean(),
+            'violation': violation.detach().mean(),
+        })
+        return result
+    
     def learn(self, batch_s, batch_a, batch_r, batch_s_, batch_dw, batch_c, batch_cv, result={}):
         # Compute critic loss
         result = self.update_critic(batch_s, batch_a, batch_r, batch_s_, batch_dw, result)
+        result = self.update_cost_critic(batch_s, batch_a, batch_s_, batch_dw, batch_c, result)
         # Optimize the critic
         self.critic_optimizer.zero_grad()
         result['critic_loss'].backward()
@@ -114,10 +174,16 @@ class SACL(SAC):
         self.critic_optimizer.step()
         self.critic_lr_scheduler.step()
 
+        self.cost_critic_optimizer.zero_grad()
+        result['cost_critic_loss'].backward()
+        torch.nn.utils.clip_grad_norm_(self.cost_critic.parameters(), max_norm=self.grad_norm)
+        self.cost_critic_optimizer.step()
+        self.cost_critic_lr_scheduler.step()
+
         if self.num_update % self.actor_update_interval == 0:
             # Freeze critic networks so you don't waste computational effort
-            for params in self.critic.parameters():
-                params.requires_grad = False
+            self.cancel_grad(self.critic)
+            self.cancel_grad(self.cost_critic)
 
             result = self.update_actor(batch_s, result)
 
@@ -137,31 +203,41 @@ class SACL(SAC):
                 self.alpha = self.log_alpha().exp()
 
             # Unfreeze critic networks
-            for params in self.critic.parameters():
-                params.requires_grad = True
+            self.use_grad(self.critic)
+            self.use_grad(self.cost_critic)
 
+        if self.num_update % self.multiplier_update_interval == 0:
+            # Freeze critic networks so you don't waste computational effort
+            self.cancel_grad(self.critic)
+            self.cancel_grad(self.cost_critic)
+
+            result = self.update_multiplier(batch_s, result)
+
+            # Optimize the multiplier
+            self.multiplier_optimizer.zero_grad()
+            result['multiplier_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(self.multiplier.parameters(), max_norm=self.grad_norm)
+            self.multiplier_optimizer.step()
+            self.multiplier_lr_scheduler.step()
+
+            # Unfreeze critic networks
+            self.use_grad(self.critic)
+            self.use_grad(self.cost_critic)
+        
         # Softly update target networks
-        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_param.data.copy_(self.TAU * param.data + (1 - self.TAU) * target_param.data)
+        self.soft_update(self.critic, self.critic_target)
+        self.soft_update(self.cost_critic, self.cost_critic_target)
 
         self.num_update += 1
 
         return result
     
-    def save(self, filedir):
-        torch.save(self.actor.state_dict(), os.path.join(filedir, 'policy_network.pth'))
-
-        return 'policy_network.pth'
-
-    def load(self, filedir):
-        self.actor.load_state_dict(torch.load(os.path.join(filedir, 'policy_network.pth')))
-
 
 def evaluate_policy(env, agent, env_name):
     times = 10  # Perform evaluations and calculate the average
     evaluate_reward = 0
     evaluate_cost = 0
-    for iteration in tqdm(range(0, times), ncols=70, desc='Evaluation', initial=1, total=times, ascii=True, disable=os.environ.get("DISABLE_TQDM", False)):
+    for _ in tqdm(range(0, times), ncols=70, desc='Evaluation', initial=1, total=times, ascii=True, disable=os.environ.get("DISABLE_TQDM", False)):
         s = env.reset()
         done = False
         episode_reward = 0
@@ -264,7 +340,6 @@ def run(config):
 
     evaluate_num = 0  # Record the number of evaluations
     total_steps = 0  # Record the total steps during the training
-    result_logs = {}
     red_list = ['ep_r', 'ep_c']
     result = {}
 
@@ -309,15 +384,13 @@ def run(config):
                         logger.log(f'- {k:15s}:{v:5.5f}', color='red')
                     else:
                         print(f'- {k:15s}:{v:5.5f}')
-
+                
                 if config['wandb']:
                     wandb.log(result)
-
-                result_log = {'log': result, 'step': total_steps}
-                result_logs[str(total_steps)] = result_log
-
+                
+                result.update({'iteration': total_steps})
                 # Save results
-                logger.save_result_logs(result_logs)
+                logger.save_result_logs(result)
 
                 # Save model
                 dir = logger.get_dir()
@@ -337,14 +410,14 @@ def run(config):
 
 def get_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--algo', default='SAC', type=str)
+    parser.add_argument('--algo', default='SACL', type=str)
     parser.add_argument('--environment', default='safety_gym', type=str) # simple_sg or safety_gym
     # parser.add_argument('--environment', default='simple_sg', type=str)
     parser.add_argument('--robot', default='Point', type=str)
     parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
-    parser.add_argument('--device', default='cuda:0', type=str)
-    parser.add_argument('--wandb', default=True, type=boolean)
+    parser.add_argument('--device', default='cuda:3', type=str)
+    parser.add_argument('--wandb', default=False, type=boolean)
     parser.add_argument('--seed', default=0, type=int)
 
     parser.add_argument('--max_train_steps', default=int(3e6), type=int)
@@ -356,17 +429,29 @@ def get_parser():
     parser.add_argument('--adaptive_alpha', default=True, type=boolean)
     parser.add_argument('--hidden_sizes', default=256)
     parser.add_argument('--batch_size', default=256, type=int)
+
     parser.add_argument('--lr', default=3e-4, type=float)
     parser.add_argument('--lr_end', default=8e-5, type=float)
+
     parser.add_argument('--actor_lr', default=8e-5, type=float)
     parser.add_argument('--actor_lr_end', default=4e-5, type=float)
     parser.add_argument('--actor_update_interval', default=int(2), type=int)
+
     parser.add_argument('--grad_norm', default=5., type=float)
     parser.add_argument('--alpha_init', default=0., type=float)
-
-
+    
     parser.add_argument('--goal_met_done', default=False, type=boolean)
     parser.add_argument('--violation_done', default=False, type=boolean)
+
+    # multiplier
+    parser.add_argument('--multiplier_lr', default=3e-4, type=float)
+    parser.add_argument('--multiplier_lr_end', default=1e-5, type=float)
+    parser.add_argument('--multiplier_update_interval', default=int(5), type=int)
+    parser.add_argument('--multiplier_init', default=10., type=float)
+    parser.add_argument('--multiplier_ub', default=50., type=float)
+    parser.add_argument('--penalty_ub', default=100., type=float)
+    parser.add_argument('--penalty_lb', default=-1., type=float)
+    parser.add_argument('--cost_limit', default=20., type=float)
 
 
     return parser

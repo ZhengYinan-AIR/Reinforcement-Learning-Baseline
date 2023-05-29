@@ -7,12 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import copy
-from torch.distributions import Normal
 import utils
 from utils import boolean
 from env.sg.sg import SafetyGymWrapper
-from run_sac import SAC, ReplayBuffer
+from run_sac import SAC, ReplayBuffer, Scalar
+
 import wandb
+from tqdm import tqdm
 
 class Cost_Critic(nn.Module):  # According to (s,a), directly calculate Q(s,a)
     def __init__(self, state_dim, action_dim, hidden_width, use_softplus=False):
@@ -46,6 +47,7 @@ class Cost_Critic(nn.Module):  # According to (s,a), directly calculate Q(s,a)
         
         return q1, q2
 
+
 class SACL(SAC):
     def __init__(self, state_dim, action_dim, max_action, config):
         super().__init__(state_dim, action_dim, max_action, config)
@@ -55,14 +57,111 @@ class SACL(SAC):
 
         self.cost_critic_optimizer = torch.optim.Adam(self.cost_critic.parameters(), lr=self.lr)
 
-        
+    def choose_action(self, s, deterministic=False):
+        s = torch.unsqueeze(torch.tensor(s, dtype=torch.float), 0).to(self.device)
+        a, _ = self.actor(s, deterministic, False)  # When choosing actions, we do not need to compute log_pi
+        return a.cpu().data.numpy().flatten()
+
+    def update_critic(self, batch_s, batch_a, batch_r, batch_s_, batch_dw, result):
+        with torch.no_grad():
+            batch_a_, log_pi_ = self.actor(batch_s_)  # a' from the current policy
+            # Compute target Q
+            target_Q1, target_Q2 = self.critic_target(batch_s_, batch_a_)
+            target_Q = batch_r + self.GAMMA * (1 - batch_dw) * (torch.min(target_Q1, target_Q2) - self.alpha * log_pi_)
+
+        # Compute current Q
+        current_Q1, current_Q2 = self.critic(batch_s, batch_a)
+        # Compute critic loss
+        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+
+        result.update({
+            'critic_loss': critic_loss,
+            'current_q': current_Q1.detach().mean(),
+            'target_q': target_Q.detach().mean(),
+            'r': batch_r.detach().mean(),
+        })
+
+        return result
+    
+    def update_actor(self, batch_s, result):
+
+        # Compute actor loss
+        a, log_pi = self.actor(batch_s)
+        Q1, Q2 = self.critic(batch_s, a)
+        Q = torch.min(Q1, Q2)
+        actor_loss = (self.alpha * log_pi - Q).mean()
+
+        # Compute alpha loss
+        if self.adaptive_alpha:
+            # We learn log_alpha instead of alpha to ensure that alpha=exp(log_alpha)>0
+            alpha_loss = -(self.log_alpha().exp() * (log_pi + self.target_entropy).detach()).mean()
+
+        result.update({
+            'actor_loss': actor_loss,
+            'alpha_loss': alpha_loss,
+            'alpha': self.log_alpha().exp().detach().mean(),
+        })
+
+        return result
+
+    def learn(self, batch_s, batch_a, batch_r, batch_s_, batch_dw, batch_c, batch_cv, result={}):
+        # Compute critic loss
+        result = self.update_critic(batch_s, batch_a, batch_r, batch_s_, batch_dw, result)
+        # Optimize the critic
+        self.critic_optimizer.zero_grad()
+        result['critic_loss'].backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=self.grad_norm)
+        self.critic_optimizer.step()
+        self.critic_lr_scheduler.step()
+
+        if self.num_update % self.actor_update_interval == 0:
+            # Freeze critic networks so you don't waste computational effort
+            for params in self.critic.parameters():
+                params.requires_grad = False
+
+            result = self.update_actor(batch_s, result)
+
+            # Optimize the actor
+            self.actor_optimizer.zero_grad()
+            result['actor_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=self.grad_norm)
+            self.actor_optimizer.step()
+            self.actor_lr_scheduler.step()
+
+            # Optimize the alpha
+            if self.adaptive_alpha:
+                self.alpha_optimizer.zero_grad()
+                result['alpha_loss'].backward()
+                torch.nn.utils.clip_grad_norm_(self.log_alpha.parameters(), max_norm=self.grad_norm)
+                self.alpha_optimizer.step()
+                self.alpha = self.log_alpha().exp()
+
+            # Unfreeze critic networks
+            for params in self.critic.parameters():
+                params.requires_grad = True
+
+        # Softly update target networks
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.TAU * param.data + (1 - self.TAU) * target_param.data)
+
+        self.num_update += 1
+
+        return result
+    
+    def save(self, filedir):
+        torch.save(self.actor.state_dict(), os.path.join(filedir, 'policy_network.pth'))
+
+        return 'policy_network.pth'
+
+    def load(self, filedir):
+        self.actor.load_state_dict(torch.load(os.path.join(filedir, 'policy_network.pth')))
 
 
 def evaluate_policy(env, agent, env_name):
     times = 10  # Perform evaluations and calculate the average
     evaluate_reward = 0
     evaluate_cost = 0
-    for _ in range(times):
+    for iteration in tqdm(range(0, times), ncols=70, desc='Evaluation', initial=1, total=times, ascii=True, disable=os.environ.get("DISABLE_TQDM", False)):
         s = env.reset()
         done = False
         episode_reward = 0
@@ -138,16 +237,16 @@ def run(config):
         max_episode_steps = 1000
     else:
         max_episode_steps = env._max_episode_steps  # Maximum number of steps per episode
-    print("env={}".format(env_name))
-    print("state_dim={}".format(state_dim))
-    print("action_dim={}".format(action_dim))
-    print("max_action={}".format(max_action))
-    print("max_episode_steps={}".format(max_episode_steps))
+
+    train_steps = config['max_train_steps'] - config['random_steps'] # the total train steps
+
     config.update({
+        'env_name': env_name,
         'state_dim': state_dim,
         'action_dim': action_dim,
         'max_action': max_action,
-        'max_episode_steps': max_episode_steps
+        'max_episode_steps': max_episode_steps,
+        'train_steps': train_steps,
     })
 
     
@@ -160,11 +259,13 @@ def run(config):
     logger = utils.Logger(**logger_kwargs)
     logger.save_config(config)
 
-    agent = SACL(state_dim, action_dim, max_action, config)
+    agent = SAC(state_dim, action_dim, max_action, config)
     replay_buffer = ReplayBuffer(state_dim, action_dim, config['device'])
 
     evaluate_num = 0  # Record the number of evaluations
     total_steps = 0  # Record the total steps during the training
+    result_logs = {}
+    red_list = ['ep_r', 'ep_c']
     result = {}
 
     while total_steps < config['max_train_steps']:
@@ -194,43 +295,56 @@ def run(config):
             s = s_
 
             if total_steps >= config['random_steps']:
-                result = agent.learn(replay_buffer)
+                result = agent.learn(*replay_buffer.sample(config['batch_size']))
 
             # Evaluate the policy every 'evaluate_freq' steps
             if total_steps % config['evaluate_freq'] == 0:
+
+                logger.log('\n==========Start evaluation==========')
                 evaluate_num += 1
                 evaluate_reward, evaluate_cost = evaluate_policy(env_evaluate, agent, config['environment'])
                 result.update({'ep_r': evaluate_reward, 'ep_c': evaluate_cost})
                 for k, v in sorted(result.items()):
-                    print(f'- {k:23s}:{v:15.10f}')
-                print(f'iteration={total_steps}')
+                    if k in red_list:
+                        logger.log(f'- {k:15s}:{v:5.5f}', color='red')
+                    else:
+                        print(f'- {k:15s}:{v:5.5f}')
+
                 if config['wandb']:
                     wandb.log(result)
 
+                result_log = {'log': result, 'step': total_steps}
+                result_logs[str(total_steps)] = result_log
+
+                # Save results
+                logger.save_result_logs(result_logs)
+
                 # Save model
                 dir = logger.get_dir()
-                agent.save(dir)
-                print('model saved')
+                file_name = agent.save(dir)
+                logger.log('Logging model to ' + file_name)
+                logger.log('\n==========Start training==========')
 
 
             total_steps += 1
 
-        print('one episode finish, episode_steps={}'.format(episode_steps))
+        logger.log('Complete one episode with {} steps'.format(total_steps), color='magenta')
 
     # Save model
     dir = logger.get_dir()
-    agent.save(dir)
-    print('model saved')
+    file_name = agent.save(dir)
+    logger.log('Logging model to ' + dir)
 
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--algo', default='SAC', type=str)
     parser.add_argument('--environment', default='safety_gym', type=str) # simple_sg or safety_gym
+    # parser.add_argument('--environment', default='simple_sg', type=str)
     parser.add_argument('--robot', default='Point', type=str)
     parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
     parser.add_argument('--device', default='cuda:0', type=str)
-    parser.add_argument('--wandb', default=False, type=boolean)
+    parser.add_argument('--wandb', default=True, type=boolean)
     parser.add_argument('--seed', default=0, type=int)
 
     parser.add_argument('--max_train_steps', default=int(3e6), type=int)
@@ -243,13 +357,17 @@ def get_parser():
     parser.add_argument('--hidden_sizes', default=256)
     parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--lr', default=3e-4, type=float)
-    parser.add_argument('--actor_lr', default=3e-5, type=float)
-    parser.add_argument('--penalty_lr', default=3e-5, type=float)
+    parser.add_argument('--lr_end', default=8e-5, type=float)
+    parser.add_argument('--actor_lr', default=8e-5, type=float)
+    parser.add_argument('--actor_lr_end', default=4e-5, type=float)
+    parser.add_argument('--actor_update_interval', default=int(2), type=int)
+    parser.add_argument('--grad_norm', default=5., type=float)
+    parser.add_argument('--alpha_init', default=0., type=float)
+
 
     parser.add_argument('--goal_met_done', default=False, type=boolean)
     parser.add_argument('--violation_done', default=False, type=boolean)
 
-    parser.add_argument('--use_softplus', default=True, type=boolean)
 
     return parser
 

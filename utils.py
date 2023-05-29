@@ -137,7 +137,7 @@ class Logger:
     def save_result_logs(self, result_logs):
         result = convert_json(result_logs)
         output = json.dumps(result, indent=4)
-        with open(osp.join(self.output_dir, self.output_fname), 'w') as out:
+        with open(osp.join(self.output_dir, self.output_fname), 'a') as out:
             out.write(output)
         # f_save = open(osp.join(self.output_dir, self.output_fname), 'wb')
         # pickle.dump(result_logs, f_save)

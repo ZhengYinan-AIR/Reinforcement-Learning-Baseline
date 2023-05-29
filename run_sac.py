@@ -250,12 +250,17 @@ class SAC(object):
             if self.adaptive_alpha:
                 self.alpha_optimizer.zero_grad()
                 result['alpha_loss'].backward()
+                torch.nn.utils.clip_grad_norm_(self.log_alpha.parameters(), max_norm=self.grad_norm)
                 self.alpha_optimizer.step()
                 self.alpha = self.log_alpha().exp()
 
             # Unfreeze critic networks
             for params in self.critic.parameters():
                 params.requires_grad = True
+
+        # Softly update target networks
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.TAU * param.data + (1 - self.TAU) * target_param.data)
 
         self.num_update += 1
 
@@ -274,7 +279,7 @@ def evaluate_policy(env, agent, env_name):
     times = 10  # Perform evaluations and calculate the average
     evaluate_reward = 0
     evaluate_cost = 0
-    for iteration in tqdm(range(0, times), ncols=70, desc='Evaluation', initial=1, total=times, ascii=True, disable=os.environ.get("DISABLE_TQDM", False)):
+    for _ in tqdm(range(0, times), ncols=70, desc='Evaluation', initial=1, total=times, ascii=True, disable=os.environ.get("DISABLE_TQDM", False)):
         s = env.reset()
         done = False
         episode_reward = 0
@@ -377,7 +382,6 @@ def run(config):
 
     evaluate_num = 0  # Record the number of evaluations
     total_steps = 0  # Record the total steps during the training
-    result_logs = {}
     red_list = ['ep_r', 'ep_c']
     result = {}
 
@@ -422,15 +426,13 @@ def run(config):
                         logger.log(f'- {k:15s}:{v:5.5f}', color='red')
                     else:
                         print(f'- {k:15s}:{v:5.5f}')
-
+                
                 if config['wandb']:
                     wandb.log(result)
-
-                result_log = {'log': result, 'step': total_steps}
-                result_logs[str(total_steps)] = result_log
-
+                
+                result.update({'iteration': total_steps})
                 # Save results
-                logger.save_result_logs(result_logs)
+                logger.save_result_logs(result)
 
                 # Save model
                 dir = logger.get_dir()
@@ -457,7 +459,7 @@ def get_parser():
     parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
     parser.add_argument('--device', default='cuda:0', type=str)
-    parser.add_argument('--wandb', default=True, type=boolean)
+    parser.add_argument('--wandb', default=False, type=boolean)
     parser.add_argument('--seed', default=0, type=int)
 
     parser.add_argument('--max_train_steps', default=int(3e6), type=int)

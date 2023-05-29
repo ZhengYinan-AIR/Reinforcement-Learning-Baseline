@@ -162,11 +162,11 @@ class Logger:
         config_json = convert_json(config)
         for k, v in config_json.items():
             if k in red_list:
-                self.log(f'- {k:23s}:{v}', color='red')
+                self.log(f'- {k:30s}:{v}', color='red')
             elif k in gray_list:
                 pass
             else:
-                print(f'- {k:23s}:{v}')
+                print(f'- {k:30s}:{v}')
         if self.exp_name is not None:
             config_json['exp_name'] = self.exp_name
 

@@ -335,7 +335,7 @@ def run(config):
     logger = utils.Logger(**logger_kwargs)
     logger.save_config(config)
 
-    agent = SAC(state_dim, action_dim, max_action, config)
+    agent = SACL(state_dim, action_dim, max_action, config)
     replay_buffer = ReplayBuffer(state_dim, action_dim, config['device'])
 
     evaluate_num = 0  # Record the number of evaluations
@@ -379,11 +379,11 @@ def run(config):
                 evaluate_num += 1
                 evaluate_reward, evaluate_cost = evaluate_policy(env_evaluate, agent, config['environment'])
                 result.update({'ep_r': evaluate_reward, 'ep_c': evaluate_cost})
-                for k, v in sorted(result.items()):
+                for k, v in result.items():
                     if k in red_list:
-                        logger.log(f'- {k:15s}:{v:5.5f}', color='red')
+                        logger.log(f'- {k:20s}:{v:5.5f}', color='red')
                     else:
-                        print(f'- {k:15s}:{v:5.5f}')
+                        print(f'- {k:20s}:{v:5.5f}')
                 
                 if config['wandb']:
                     wandb.log(result)
@@ -452,6 +452,7 @@ def get_parser():
     parser.add_argument('--penalty_ub', default=100., type=float)
     parser.add_argument('--penalty_lb', default=-1., type=float)
     parser.add_argument('--cost_limit', default=20., type=float)
+    parser.add_argument('--use_softplus', default=True, type=boolean)
 
 
     return parser

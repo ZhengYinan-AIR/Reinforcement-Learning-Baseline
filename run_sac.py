@@ -430,11 +430,11 @@ def run(config):
                 evaluate_num += 1
                 evaluate_reward, evaluate_cost = evaluate_policy(env_evaluate, agent, config['environment'])
                 result.update({'ep_r': evaluate_reward, 'ep_c': evaluate_cost})
-                for k, v in sorted(result.items()):
+                for k, v in result.items():
                     if k in red_list:
-                        logger.log(f'- {k:15s}:{v:5.5f}', color='red')
+                        logger.log(f'- {k:20s}:{v:5.5f}', color='red')
                     else:
-                        print(f'- {k:15s}:{v:5.5f}')
+                        print(f'- {k:20s}:{v:5.5f}')
                 
                 if config['wandb']:
                     wandb.log(result)

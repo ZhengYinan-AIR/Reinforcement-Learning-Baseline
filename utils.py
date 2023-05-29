@@ -130,7 +130,7 @@ class Logger:
         else:
             os.makedirs(self.output_dir)
         
-        print(colorize("Logging data to %s"%self.output_dir, 'green', bold=True))
+        # print(colorize("Logging data to %s"%self.output_dir, 'green', bold=True))
 
         self.exp_name = exp_name
     
@@ -143,7 +143,7 @@ class Logger:
         # pickle.dump(result_logs, f_save)
         # f_save.close()
 
-        print(colorize("Logging results to %s"%out.name, 'green', bold=True))
+        print(colorize("Logging results to %s"%self.output_fname, 'green', bold=True))
 
     def save_config(self, config):
         """
@@ -154,17 +154,29 @@ class Logger:
         handling anything which can't be serialized in a graceful way (writing
         as informative a string as possible). 
         """
+        red_list = ['algo', 'environment', 'env_name', 'device', 'wandb', 'seed', 'state_dim', 'action_dim']
+        if config['environment'] == 'simple_sg':
+            gray_list = ['robot', 'task']
+        else:
+            gray_list = []
         config_json = convert_json(config)
+        for k, v in config_json.items():
+            if k in red_list:
+                self.log(f'- {k:23s}:{v}', color='red')
+            elif k in gray_list:
+                pass
+            else:
+                print(f'- {k:23s}:{v}')
         if self.exp_name is not None:
             config_json['exp_name'] = self.exp_name
 
         # output = json.dumps(config_json, separators=(',',':\t'), indent=4)
         output = json.dumps(config_json, indent=4)
-        print(colorize('Saving config:', color='cyan', bold=True))
-        print(output)
+        # print(output)
+
         with open(osp.join(self.output_dir, "config.json"), 'w') as out:
             out.write(output)
-        print(colorize("Logging results to %s"%out.name, 'green', bold=True))
+        print(colorize("Logging config to %s"%out.name, 'cyan', bold=True))
 
     def get_dir(self):
         return self.output_dir
@@ -172,6 +184,9 @@ class Logger:
     def log(self, msg, color='green'):
         """Print a colorized message to stdout."""
         print(colorize(msg, color, bold=True))
+
+    # def print_config(self, config):
+        
         
 if __name__=='__main__':
     print(DEFAULT_DATA_DIR)

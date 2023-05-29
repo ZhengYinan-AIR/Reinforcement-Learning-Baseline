@@ -14,9 +14,47 @@ from env.sg.sg import SafetyGymWrapper
 from run_sac import SAC, ReplayBuffer
 import wandb
 
+class Cost_Critic(nn.Module):  # According to (s,a), directly calculate Q(s,a)
+    def __init__(self, state_dim, action_dim, hidden_width, use_softplus=False):
+        super(Cost_Critic, self).__init__()
+        # Q1
+        self.l1 = nn.Linear(state_dim + action_dim, hidden_width)
+        self.l2 = nn.Linear(hidden_width, hidden_width)
+        self.l3 = nn.Linear(hidden_width, 1)
+        # Q2
+        self.l4 = nn.Linear(state_dim + action_dim, hidden_width)
+        self.l5 = nn.Linear(hidden_width, hidden_width)
+        self.l6 = nn.Linear(hidden_width, 1)
+
+        self.use_softplus = use_softplus
+
+    def forward(self, s, a):
+        s_a = torch.cat([s, a], 1)
+        q1 = F.relu(self.l1(s_a))
+        q1 = F.relu(self.l2(q1))
+        if self.use_softplus:
+            q1 = F.softplus(self.l3(q1))
+        else:
+            q1 = self.l3(q1)
+
+        q2 = F.relu(self.l4(s_a))
+        q2 = F.relu(self.l5(q2))
+        if self.use_softplus:
+            q2 = F.softplus(self.l6(q2))
+        else:
+            q2 = self.l6(q2)
+        
+        return q1, q2
+
 class SACL(SAC):
     def __init__(self, state_dim, action_dim, max_action, config):
         super().__init__(state_dim, action_dim, max_action, config)
+
+        self.cost_critic = Cost_Critic(state_dim, action_dim, self.hidden_width, use_softplus=config['use_softplus']).to(self.device)
+        self.cost_critic_target = copy.deepcopy(self.cost_critic).to(self.device)
+
+        self.cost_critic_optimizer = torch.optim.Adam(self.cost_critic.parameters(), lr=self.lr)
+
         
 
 
@@ -206,10 +244,12 @@ def get_parser():
     parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--lr', default=3e-4, type=float)
     parser.add_argument('--actor_lr', default=3e-5, type=float)
+    parser.add_argument('--penalty_lr', default=3e-5, type=float)
 
     parser.add_argument('--goal_met_done', default=False, type=boolean)
     parser.add_argument('--violation_done', default=False, type=boolean)
 
+    parser.add_argument('--use_softplus', default=True, type=boolean)
 
     return parser
 

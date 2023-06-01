@@ -15,6 +15,42 @@ from env.sg.sg import SafetyGymWrapper
 import wandb
 from tqdm import tqdm
 
+# class Actor(nn.Module):
+#     def __init__(self, state_dim, action_dim, hidden_width, max_action):
+#         super(Actor, self).__init__()
+#         self.max_action = max_action
+#         self.l1 = nn.Linear(state_dim, hidden_width)
+#         self.l2 = nn.Linear(hidden_width, hidden_width)
+#         self.mean_layer = nn.Linear(hidden_width, action_dim)
+#         self.log_std_layer = nn.Linear(hidden_width, action_dim)
+
+#     def forward(self, x, deterministic=False, with_logprob=True):
+#         x = F.relu(self.l1(x))
+#         x = F.relu(self.l2(x))
+#         mean = self.mean_layer(x)
+#         log_std = self.log_std_layer(x)  # We output the log_std to ensure that std=exp(log_std)>0
+#         log_std = torch.clamp(log_std, -20, 2)
+#         std = torch.exp(log_std)
+
+#         dist = Normal(mean, std)  # Generate a Gaussian distribution
+#         if deterministic:  # When evaluating，we use the deterministic policy
+#             a = mean
+#         else:
+#             a = dist.rsample()  # reparameterization trick: mean+std*N(0,1)
+
+#         if with_logprob:  # The method refers to Open AI Spinning up, which is more stable.
+#             log_pi = dist.log_prob(a).sum(dim=1, keepdim=True)
+#             log_pi -= (2 * (np.log(2) - a - F.softplus(-2 * a))).sum(dim=1, keepdim=True)
+#         else:
+#             log_pi = None
+
+#         a = self.max_action * torch.tanh(a)  # Use tanh to compress the unbounded Gaussian distribution into a bounded action interval.
+
+#         return a, log_pi
+
+LOG_STD_MIN = -5
+LOG_STD_MAX = 2
+
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_width, max_action):
         super(Actor, self).__init__()
@@ -29,7 +65,7 @@ class Actor(nn.Module):
         x = F.relu(self.l2(x))
         mean = self.mean_layer(x)
         log_std = self.log_std_layer(x)  # We output the log_std to ensure that std=exp(log_std)>0
-        log_std = torch.clamp(log_std, -20, 2)
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
         std = torch.exp(log_std)
 
         dist = Normal(mean, std)  # Generate a Gaussian distribution
@@ -47,7 +83,6 @@ class Actor(nn.Module):
         a = self.max_action * torch.tanh(a)  # Use tanh to compress the unbounded Gaussian distribution into a bounded action interval.
 
         return a, log_pi
-
 
 class Critic(nn.Module):  # According to (s,a), directly calculate Q(s,a)
     def __init__(self, state_dim, action_dim, hidden_width):
@@ -140,6 +175,7 @@ class SAC(object):
         self.actor_lr_end = config['actor_lr_end']
         self.actor_update_interval = config['actor_update_interval']
         self.grad_norm = config['grad_norm']
+        self.alpha_lr = config['alpha_lr']
 
         self.updates_per_training = config['train_steps']
         self.actor_updates_num = int(self.updates_per_training / self.actor_update_interval)
@@ -151,7 +187,7 @@ class SAC(object):
             # We learn log_alpha instead of alpha to ensure that alpha=exp(log_alpha)>0
             self.log_alpha = Scalar(init_value=config['alpha_init']).to(self.device)
             self.alpha = self.log_alpha().exp()
-            self.alpha_optimizer = torch.optim.Adam(self.log_alpha.parameters(), lr=self.actor_lr)
+            self.alpha_optimizer = torch.optim.Adam(self.log_alpha.parameters(), lr=self.alpha_lr)
         else:
             self.alpha = 0.2
 
@@ -179,14 +215,6 @@ class SAC(object):
         s = torch.unsqueeze(torch.tensor(s, dtype=torch.float), 0).to(self.device)
         a, _ = self.actor(s, deterministic, False)  # When choosing actions, we do not need to compute log_pi
         return a.cpu().data.numpy().flatten()
-
-    def cancel_grad(self, net):
-        for params in net.parameters():
-            params.requires_grad = False
-
-    def use_grad(self, net):
-        for params in net.parameters():
-            params.requires_grad = True
 
     def soft_update(self, net, target_net):
         for param, target_param in zip(net.parameters(), target_net.parameters()):
@@ -245,8 +273,6 @@ class SAC(object):
         self.critic_lr_scheduler.step()
 
         if self.num_update % self.actor_update_interval == 0:
-            # Freeze critic networks so you don't waste computational effort
-            self.cancel_grad(self.critic)
 
             result = self.update_actor(batch_s, result)
 
@@ -264,9 +290,6 @@ class SAC(object):
                 torch.nn.utils.clip_grad_norm_(self.log_alpha.parameters(), max_norm=self.grad_norm)
                 self.alpha_optimizer.step()
                 self.alpha = self.log_alpha().exp()
-
-            # Unfreeze critic networks
-            self.use_grad(self.critic)
 
         # Softly update target networks
         self.soft_update(self.critic, self.critic_target)
@@ -405,6 +428,10 @@ def run(config):
             else:
                 a = agent.choose_action(s)
             s_, r, done, info = env.step(a)
+
+            if config['use_reward_scale']:
+                r = r * config['reward_scale']
+            
             if config['goal_met_done']:
                 info_keys = info.keys()
                 goal_met = ('goal_met' in info_keys)
@@ -467,9 +494,9 @@ def get_parser():
     parser.add_argument('--robot', default='Point', type=str)
     parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
-    parser.add_argument('--device', default='cuda:0', type=str)
-    parser.add_argument('--wandb', default=False, type=boolean)
-    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--device', default='cuda:3', type=str)
+    parser.add_argument('--wandb', default=True, type=boolean)
+    parser.add_argument('--seed', default=1112, type=int)
 
     parser.add_argument('--max_train_steps', default=int(3e6), type=int)
     parser.add_argument('--evaluate_freq', default=int(5e3), type=int)
@@ -482,15 +509,18 @@ def get_parser():
     parser.add_argument('--batch_size', default=256, type=int)
     parser.add_argument('--lr', default=3e-4, type=float)
     parser.add_argument('--lr_end', default=8e-5, type=float)
-    parser.add_argument('--actor_lr', default=8e-5, type=float)
-    parser.add_argument('--actor_lr_end', default=4e-5, type=float)
-    parser.add_argument('--actor_update_interval', default=int(2), type=int)
+    parser.add_argument('--actor_lr', default=3e-4, type=float)
+    parser.add_argument('--actor_lr_end', default=8e-5, type=float)
+    parser.add_argument('--actor_update_interval', default=int(1), type=int)
     parser.add_argument('--grad_norm', default=5., type=float)
     parser.add_argument('--alpha_init', default=0., type=float)
-
+    parser.add_argument('--alpha_lr', default=8e-5, type=float)
 
     parser.add_argument('--goal_met_done', default=False, type=boolean)
     parser.add_argument('--violation_done', default=False, type=boolean)
+
+    parser.add_argument('--use_reward_scale', default=True, type=boolean)
+    parser.add_argument('--reward_scale', default=200., type=float)
 
 
     return parser

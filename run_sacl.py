@@ -10,7 +10,7 @@ import copy
 import utils
 from utils import boolean
 from env.sg.sg import SafetyGymWrapper
-from run_sac import SAC, ReplayBuffer, Scalar
+from run_sac import SAC, ReplayBuffer
 
 import wandb
 from tqdm import tqdm
@@ -134,6 +134,8 @@ class SACL(SAC):
         cstr_actor_loss= torch.mean(multiplier.detach() * violation)
 
         actor_loss = uncstr_actor_loss + cstr_actor_loss
+        # actor_loss = uncstr_actor_loss
+
 
         result.update({
             'uncstr_actor_loss': uncstr_actor_loss,
@@ -181,9 +183,6 @@ class SACL(SAC):
         self.cost_critic_lr_scheduler.step()
 
         if self.num_update % self.actor_update_interval == 0:
-            # Freeze critic networks so you don't waste computational effort
-            self.cancel_grad(self.critic)
-            self.cancel_grad(self.cost_critic)
 
             result = self.update_actor(batch_s, result)
 
@@ -202,27 +201,16 @@ class SACL(SAC):
                 self.alpha_optimizer.step()
                 self.alpha = self.log_alpha().exp()
 
-            # Unfreeze critic networks
-            self.use_grad(self.critic)
-            self.use_grad(self.cost_critic)
+
 
         if self.num_update % self.multiplier_update_interval == 0:
-            # Freeze critic networks so you don't waste computational effort
-            self.cancel_grad(self.critic)
-            self.cancel_grad(self.cost_critic)
-
             result = self.update_multiplier(batch_s, result)
-
             # Optimize the multiplier
             self.multiplier_optimizer.zero_grad()
             result['multiplier_loss'].backward()
             torch.nn.utils.clip_grad_norm_(self.multiplier.parameters(), max_norm=self.grad_norm)
             self.multiplier_optimizer.step()
             self.multiplier_lr_scheduler.step()
-
-            # Unfreeze critic networks
-            self.use_grad(self.critic)
-            self.use_grad(self.cost_critic)
         
         # Softly update target networks
         self.soft_update(self.critic, self.critic_target)
@@ -354,6 +342,10 @@ def run(config):
             else:
                 a = agent.choose_action(s)
             s_, r, done, info = env.step(a)
+
+            if config['use_reward_scale']:
+                r = r * config['reward_scale']
+
             if config['goal_met_done']:
                 info_keys = info.keys()
                 goal_met = ('goal_met' in info_keys)
@@ -410,6 +402,7 @@ def run(config):
 
 def get_parser():
     parser = argparse.ArgumentParser()
+    # SAC config
     parser.add_argument('--algo', default='SACL', type=str)
     parser.add_argument('--environment', default='safety_gym', type=str) # simple_sg or safety_gym
     # parser.add_argument('--environment', default='simple_sg', type=str)
@@ -417,8 +410,8 @@ def get_parser():
     parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
     parser.add_argument('--device', default='cuda:3', type=str)
-    parser.add_argument('--wandb', default=False, type=boolean)
-    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--wandb', default=True, type=boolean)
+    parser.add_argument('--seed', default=1283, type=int)
 
     parser.add_argument('--max_train_steps', default=int(3e6), type=int)
     parser.add_argument('--evaluate_freq', default=int(5e3), type=int)
@@ -429,30 +422,32 @@ def get_parser():
     parser.add_argument('--adaptive_alpha', default=True, type=boolean)
     parser.add_argument('--hidden_sizes', default=256)
     parser.add_argument('--batch_size', default=256, type=int)
-
     parser.add_argument('--lr', default=3e-4, type=float)
     parser.add_argument('--lr_end', default=8e-5, type=float)
-
     parser.add_argument('--actor_lr', default=8e-5, type=float)
     parser.add_argument('--actor_lr_end', default=4e-5, type=float)
-    parser.add_argument('--actor_update_interval', default=int(2), type=int)
-
+    parser.add_argument('--actor_update_interval', default=int(1), type=int)
     parser.add_argument('--grad_norm', default=5., type=float)
     parser.add_argument('--alpha_init', default=0., type=float)
-    
+    parser.add_argument('--alpha_lr', default=8e-5, type=float)
     parser.add_argument('--goal_met_done', default=False, type=boolean)
     parser.add_argument('--violation_done', default=False, type=boolean)
 
+    parser.add_argument('--use_reward_scale', default=True, type=boolean)
+    parser.add_argument('--reward_scale', default=200., type=float)
+
     # multiplier
+    parser.add_argument('--use_multiplier', default=False, type=boolean) # test the sac 
     parser.add_argument('--multiplier_lr', default=3e-4, type=float)
     parser.add_argument('--multiplier_lr_end', default=1e-5, type=float)
-    parser.add_argument('--multiplier_update_interval', default=int(5), type=int)
-    parser.add_argument('--multiplier_init', default=10., type=float)
-    parser.add_argument('--multiplier_ub', default=50., type=float)
+    parser.add_argument('--multiplier_update_interval', default=int(2), type=int)
+    parser.add_argument('--multiplier_init', default=0.5, type=float)
+    parser.add_argument('--multiplier_ub', default=25., type=float)
     parser.add_argument('--penalty_ub', default=100., type=float)
     parser.add_argument('--penalty_lb', default=-1., type=float)
     parser.add_argument('--cost_limit', default=20., type=float)
     parser.add_argument('--use_softplus', default=True, type=boolean)
+
 
 
     return parser

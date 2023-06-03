@@ -10,45 +10,11 @@ import copy
 import utils
 from utils import boolean
 from env.sg.sg import SafetyGymWrapper
-from run_sacl import SACL, Cost_Critic
+from run_sacl import SACL
 
 import wandb
 from tqdm import tqdm
-
-class Cost_Critic(nn.Module):  # single critic network
-    def __init__(self, state_dim, action_dim, hidden_width, use_softplus=False):
-        super(Cost_Critic, self).__init__()
-        # Q1
-        self.l1 = nn.Linear(state_dim + action_dim, hidden_width)
-        self.l2 = nn.Linear(hidden_width, hidden_width)
-        self.l3 = nn.Linear(hidden_width, 1)
-
-        self.use_softplus = use_softplus
-
-    def forward(self, s, a):
-        s_a = torch.cat([s, a], 1)
-        q1 = F.relu(self.l1(s_a))
-        q1 = F.relu(self.l2(q1))
-        if self.use_softplus:
-            q1 = F.softplus(self.l3(q1))
-        else:
-            q1 = self.l3(q1)
-        
-        return q1
-    
-class V_critic(nn.Module):
-    def __init__(self, num_state, num_hidden):
-        super(V_critic, self).__init__()
-        
-        self.fc1 = nn.Linear(num_state, num_hidden)
-        self.fc2 = nn.Linear(num_hidden, num_hidden)
-        self.state_value = nn.Linear(num_hidden, 1)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        v = self.state_value(x)
-        return v
+from network import Critic, V_critic
 
 class ReplayBuffer(object):
     def __init__(self, state_dim, action_dim, device):
@@ -82,19 +48,16 @@ class ReplayBuffer(object):
         self.cv[self.count] = cv      
         self.count = (self.count + 1) % self.max_size  # When the 'count' reaches max_size, it will be reset to 0.
         self.size = min(self.size + 1, self.max_size)  # Record the number of  transitions
-        if ss is not None:
-            self.ss[self.ss_count] = ss
-            self.ss_count = (self.ss_count + 1) % self.max_size
-            self.ss_size = min(self.ss_size + 1, self.max_size)
-        if us is not None:
-            self.us[self.us_count] = us
-            self.us_count = (self.us_count + 1) % self.max_size
-            self.us_size = min(self.us_size + 1, self.max_size)
     
     def store_safe_init(self, ss):
         self.ss[self.ss_count] = ss
         self.ss_count = (self.ss_count + 1) % self.max_size
         self.ss_size = min(self.ss_size + 1, self.max_size)
+
+    def store_unsafe_state(self, us):
+        self.us[self.us_count] = us
+        self.us_count = (self.us_count + 1) % self.max_size
+        self.us_size = min(self.us_size + 1, self.max_size)
 
     def sample(self, batch_size):
         index = np.random.choice(self.size, size=batch_size)  # Randomly sampling
@@ -120,7 +83,7 @@ class SAC_CBF(SACL):
         super().__init__(state_dim, action_dim, max_action, config)
 
         self.cbf_lambda = config['cbf_lambda']
-        self.epsilon = config['epsilon']
+
         self.certificate = V_critic(state_dim, self.hidden_width).to(self.device)
         self.certificate_optimizer = torch.optim.Adam(self.certificate.parameters(), lr=self.lr)
         self.certificate_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -130,7 +93,7 @@ class SAC_CBF(SACL):
         )
 
         # single q net
-        self.cost_critic = Cost_Critic(state_dim, action_dim, self.hidden_width, use_softplus=config['use_softplus']).to(self.device)
+        self.cost_critic = Critic(state_dim, action_dim, self.hidden_width, use_softplus=config['use_softplus']).to(self.device)
         self.cost_critic_optimizer = torch.optim.Adam(self.cost_critic.parameters(), lr=self.lr)
         self.cost_critic_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.cost_critic_optimizer,
@@ -139,103 +102,54 @@ class SAC_CBF(SACL):
         )
 
     def update_cost_certificate(self, batch_s, batch_s_, batch_ss, batch_us, result):
-        feasible_loss = torch.mean(torch.relu(self.certificate(batch_ss) + self.epsilon))
-        infeasible_loss = torch.mean(torch.relu(-self.certificate(batch_us) + self.epsilon))
-        certificate = self.certificate(batch_s_) - (1 - self.cbf_lambda) *self.certificate(batch_s)
-        certificate_loss = torch.mean(torch.relu(certificate))
-        cbf_loss = feasible_loss + infeasible_loss + certificate_loss
+        feasible_loss = torch.mean(torch.relu(self.certificate(batch_ss)))
+        infeasible_loss = torch.mean(torch.relu(-self.certificate(batch_us)))
+        invariance = self.certificate(batch_s_) - (1 - self.cbf_lambda) *self.certificate(batch_s)
+        invariant_loss = torch.mean(torch.relu(invariance))
+        cbf_loss = feasible_loss + infeasible_loss + invariant_loss
         result.update({
             'feasible_loss': feasible_loss,
             'infeasible_loss': infeasible_loss,
+            'invariant_loss': invariant_loss,
             'cbf_loss': cbf_loss,
             'certificate': self.certificate(batch_s).detach().mean(),
         })
         return result
-    def update_cost_critic(self, batch_s, batch_a, batch_s_, batch_dw, batch_c, result): # not need batch_r！
+        
+    def update_cost_critic(self, batch_s, batch_a, batch_s_, result): # not need batch_r！
 
         with torch.no_grad():
-            batch_a_, log_pi_ = self.actor(batch_s_)  # a' from the current policy
-            # Compute target Qc
-            target_Qc1, target_Qc2 = self.cost_critic_target(batch_s_, batch_a_)
-            target_Qc = batch_c + self.GAMMA * (1 - batch_dw) * torch.max(target_Qc1, target_Qc2) # qc use the torch.max
+            target_Qc = self.certificate(batch_s_) - (1 - self.cbf_lambda) *self.certificate(batch_s)
 
         # Compute current Qc
-        current_Qc1, current_Qc2 = self.cost_critic(batch_s, batch_a)
+        current_Qc = self.cost_critic(batch_s, batch_a)
         # Compute cost_critic loss
-        cost_critic_loss = F.mse_loss(current_Qc1, target_Qc) + F.mse_loss(current_Qc2, target_Qc)
+        cost_critic_loss = F.mse_loss(current_Qc, target_Qc)
 
         result.update({
             'cost_critic_loss': cost_critic_loss,
-            'current_qc': current_Qc1.detach().mean(),
+            'current_qc': current_Qc.detach().mean(),
             'target_qc': target_Qc.detach().mean(),
-            'c': batch_c.detach().mean(),
-        })
-        return result
-    
-    def update_actor(self, batch_s, result):
-
-        # Compute actor loss
-        a, log_pi = self.actor(batch_s)
-        Q1, Q2 = self.critic(batch_s, a)
-        Q = torch.min(Q1, Q2)
-        uncstr_actor_loss = (self.alpha * log_pi - Q).mean()
-
-        # Compute alpha loss
-        if self.adaptive_alpha:
-            # We learn log_alpha instead of alpha to ensure that alpha=exp(log_alpha)>0
-            alpha_loss = -(self.log_alpha().exp() * (log_pi + self.target_entropy).detach()).mean()
-
-        # Constrained part
-        Qc1, Qc2 = self.cost_critic(batch_s, a)
-        Qc= torch.max(Qc1, Qc2)
-        violation = Qc - self.cost_limit
-        violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
-
-        multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
-        cstr_actor_loss= torch.mean(multiplier.detach() * violation)
-
-        actor_loss = uncstr_actor_loss + cstr_actor_loss
-        # actor_loss = uncstr_actor_loss
-
-
-        result.update({
-            'uncstr_actor_loss': uncstr_actor_loss,
-            'cstr_actor_loss': cstr_actor_loss,
-            'actor_loss': actor_loss,
-            'alpha_loss': alpha_loss,
-            'alpha': self.log_alpha().exp().detach().mean(),
-        })
-        return result
-    
-    def update_multiplier(self, batch_s, result):
-        # Constrained part
-        a, _ = self.actor(batch_s)
-        Qc1, Qc2 = self.cost_critic(batch_s, a)
-        Qc= torch.max(Qc1, Qc2)
-        violation = Qc - self.cost_limit
-        violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
-
-        multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
-
-        multiplier_loss = -torch.mean(multiplier * violation.detach()) 
-
-        result.update({
-            'multiplier_loss': multiplier_loss,
-            'multiplier': multiplier.detach().mean(),
-            'violation': violation.detach().mean(),
         })
         return result
     
     def learn(self, batch_s, batch_a, batch_r, batch_s_, batch_dw, batch_c, batch_cv, batch_ss, batch_us, result={}):
         # Compute critic loss
         result = self.update_critic(batch_s, batch_a, batch_r, batch_s_, batch_dw, result)
-        result = self.update_cost_critic(batch_s, batch_a, batch_s_, batch_dw, batch_c, result)
+        result = self.update_cost_certificate(batch_s, batch_s_, batch_ss, batch_us, result)
+        result = self.update_cost_critic(batch_s, batch_a, batch_s_, result)
         # Optimize the critic
         self.critic_optimizer.zero_grad()
         result['critic_loss'].backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=self.grad_norm)
         self.critic_optimizer.step()
         self.critic_lr_scheduler.step()
+
+        self.certificate_optimizer.zero_grad()
+        result['cbf_loss'].backward()
+        torch.nn.utils.clip_grad_norm_(self.certificate.parameters(), max_norm=self.grad_norm)
+        self.certificate_optimizer.step()
+        self.certificate_lr_scheduler.step()
 
         self.cost_critic_optimizer.zero_grad()
         result['cost_critic_loss'].backward()
@@ -275,7 +189,7 @@ class SAC_CBF(SACL):
         
         # Softly update target networks
         self.soft_update(self.critic, self.critic_target)
-        self.soft_update(self.cost_critic, self.cost_critic_target)
+        # self.soft_update(self.cost_critic, self.cost_critic_target)
 
         self.num_update += 1
 
@@ -422,15 +336,9 @@ def run(config):
                 cv = torch.tensor(info['constraint_value'], dtype=torch.float)
             
             if c == 1.:
-                print('state is unsafe')
-                us = s_
-                ss = None
-            else:
-                print('state is safe')
-                ss = s_
-                us = None
+                replay_buffer.store_unsafe_state(s_)
 
-            replay_buffer.store(s, a, r, s_, done, c, cv, ss=ss, us=us)  # Store the transition
+            replay_buffer.store(s, a, r, s_, done, c, cv)  # Store the transition
             s = s_
 
             if total_steps >= config['random_steps']:
@@ -483,7 +391,7 @@ def get_parser():
     parser.add_argument('--env_name', default='point', type=str)
     parser.add_argument('--device', default='cuda:3', type=str)
     parser.add_argument('--wandb', default=False, type=boolean)
-    parser.add_argument('--seed', default=1283, type=int)
+    parser.add_argument('--seed', default=0, type=int)
 
     parser.add_argument('--max_train_steps', default=int(2e6), type=int)
     parser.add_argument('--evaluate_freq', default=int(5e3), type=int)
@@ -498,7 +406,7 @@ def get_parser():
     parser.add_argument('--lr_end', default=8e-5, type=float)
     parser.add_argument('--actor_lr', default=8e-5, type=float)
     parser.add_argument('--actor_lr_end', default=4e-5, type=float)
-    parser.add_argument('--actor_update_interval', default=int(1), type=int)
+    parser.add_argument('--actor_update_interval', default=int(2), type=int)
     parser.add_argument('--grad_norm', default=5., type=float)
     parser.add_argument('--alpha_init', default=0., type=float)
     parser.add_argument('--alpha_lr', default=8e-5, type=float)
@@ -512,7 +420,7 @@ def get_parser():
     parser.add_argument('--use_multiplier', default=False, type=boolean) # test the sac 
     parser.add_argument('--multiplier_lr', default=3e-4, type=float)
     parser.add_argument('--multiplier_lr_end', default=1e-5, type=float)
-    parser.add_argument('--multiplier_update_interval', default=int(2), type=int)
+    parser.add_argument('--multiplier_update_interval', default=int(5), type=int)
     parser.add_argument('--multiplier_init', default=0.5, type=float)
     parser.add_argument('--multiplier_ub', default=25., type=float)
     parser.add_argument('--penalty_ub', default=100., type=float)
@@ -521,7 +429,6 @@ def get_parser():
 
     parser.add_argument('--use_softplus', default=False, type=boolean) # cbf need value below zero
     parser.add_argument('--cbf_lambda', default=0.1, type=float) 
-    parser.add_argument('--epsilon', default=0.01, type=float)
 
 
 

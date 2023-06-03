@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import copy
-from torch.distributions import Normal
+
 import utils
 from utils import boolean
 from env.sg.sg import SafetyGymWrapper
@@ -15,113 +15,7 @@ from env.sg.sg import SafetyGymWrapper
 import wandb
 from tqdm import tqdm
 
-# class Actor(nn.Module):
-#     def __init__(self, state_dim, action_dim, hidden_width, max_action):
-#         super(Actor, self).__init__()
-#         self.max_action = max_action
-#         self.l1 = nn.Linear(state_dim, hidden_width)
-#         self.l2 = nn.Linear(hidden_width, hidden_width)
-#         self.mean_layer = nn.Linear(hidden_width, action_dim)
-#         self.log_std_layer = nn.Linear(hidden_width, action_dim)
-
-#     def forward(self, x, deterministic=False, with_logprob=True):
-#         x = F.relu(self.l1(x))
-#         x = F.relu(self.l2(x))
-#         mean = self.mean_layer(x)
-#         log_std = self.log_std_layer(x)  # We output the log_std to ensure that std=exp(log_std)>0
-#         log_std = torch.clamp(log_std, -20, 2)
-#         std = torch.exp(log_std)
-
-#         dist = Normal(mean, std)  # Generate a Gaussian distribution
-#         if deterministic:  # When evaluating，we use the deterministic policy
-#             a = mean
-#         else:
-#             a = dist.rsample()  # reparameterization trick: mean+std*N(0,1)
-
-#         if with_logprob:  # The method refers to Open AI Spinning up, which is more stable.
-#             log_pi = dist.log_prob(a).sum(dim=1, keepdim=True)
-#             log_pi -= (2 * (np.log(2) - a - F.softplus(-2 * a))).sum(dim=1, keepdim=True)
-#         else:
-#             log_pi = None
-
-#         a = self.max_action * torch.tanh(a)  # Use tanh to compress the unbounded Gaussian distribution into a bounded action interval.
-
-#         return a, log_pi
-
-LOG_STD_MIN = -5
-LOG_STD_MAX = 2
-
-class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_width, max_action):
-        super(Actor, self).__init__()
-        self.max_action = max_action
-        self.l1 = nn.Linear(state_dim, hidden_width)
-        self.l2 = nn.Linear(hidden_width, hidden_width)
-        self.mean_layer = nn.Linear(hidden_width, action_dim)
-        self.log_std_layer = nn.Linear(hidden_width, action_dim)
-
-    def forward(self, x, deterministic=False, with_logprob=True):
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        mean = self.mean_layer(x)
-        log_std = self.log_std_layer(x)  # We output the log_std to ensure that std=exp(log_std)>0
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        std = torch.exp(log_std)
-
-        dist = Normal(mean, std)  # Generate a Gaussian distribution
-        if deterministic:  # When evaluating，we use the deterministic policy
-            a = mean
-        else:
-            a = dist.rsample()  # reparameterization trick: mean+std*N(0,1)
-
-        if with_logprob:  # The method refers to Open AI Spinning up, which is more stable.
-            log_pi = dist.log_prob(a).sum(dim=1, keepdim=True)
-            log_pi -= (2 * (np.log(2) - a - F.softplus(-2 * a))).sum(dim=1, keepdim=True)
-        else:
-            log_pi = None
-
-        a = self.max_action * torch.tanh(a)  # Use tanh to compress the unbounded Gaussian distribution into a bounded action interval.
-
-        return a, log_pi
-
-class Critic(nn.Module):  # According to (s,a), directly calculate Q(s,a)
-    def __init__(self, state_dim, action_dim, hidden_width):
-        super(Critic, self).__init__()
-        # Q1
-        self.l1 = nn.Linear(state_dim + action_dim, hidden_width)
-        self.l2 = nn.Linear(hidden_width, hidden_width)
-        self.l3 = nn.Linear(hidden_width, 1)
-        # Q2
-        self.l4 = nn.Linear(state_dim + action_dim, hidden_width)
-        self.l5 = nn.Linear(hidden_width, hidden_width)
-        self.l6 = nn.Linear(hidden_width, 1)
-
-    def forward(self, s, a):
-        s_a = torch.cat([s, a], 1)
-        q1 = F.relu(self.l1(s_a))
-        q1 = F.relu(self.l2(q1))
-        q1 = self.l3(q1)
-
-        q2 = F.relu(self.l4(s_a))
-        q2 = F.relu(self.l5(q2))
-        q2 = self.l6(q2)
-
-        return q1, q2
-    
-"""
-alpha auto tuning
-"""
-class Scalar(nn.Module):
-    def __init__(self, init_value):
-        super().__init__()
-        self.init_value = init_value
-        self.constant = nn.Parameter(
-            torch.tensor(self.init_value, requires_grad=True)
-        )
-
-    def forward(self):
-        return self.constant
-
+from network import Actor, Double_Critic, Scalar
 
 class ReplayBuffer(object):
     def __init__(self, state_dim, action_dim, device):
@@ -192,7 +86,7 @@ class SAC(object):
             self.alpha = 0.2
 
         self.actor = Actor(state_dim, action_dim, self.hidden_width, max_action).to(self.device)
-        self.critic = Critic(state_dim, action_dim, self.hidden_width).to(self.device)
+        self.critic = Double_Critic(state_dim, action_dim, self.hidden_width).to(self.device)
         self.critic_target = copy.deepcopy(self.critic).to(self.device)
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.actor_lr)

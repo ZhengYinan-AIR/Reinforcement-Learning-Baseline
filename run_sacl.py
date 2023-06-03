@@ -15,48 +15,7 @@ from run_sac import SAC, ReplayBuffer
 import wandb
 from tqdm import tqdm
 
-class Cost_Critic(nn.Module):  # According to (s,a), directly calculate Q(s,a)
-    def __init__(self, state_dim, action_dim, hidden_width, use_softplus=False):
-        super(Cost_Critic, self).__init__()
-        # Q1
-        self.l1 = nn.Linear(state_dim + action_dim, hidden_width)
-        self.l2 = nn.Linear(hidden_width, hidden_width)
-        self.l3 = nn.Linear(hidden_width, 1)
-        # Q2
-        self.l4 = nn.Linear(state_dim + action_dim, hidden_width)
-        self.l5 = nn.Linear(hidden_width, hidden_width)
-        self.l6 = nn.Linear(hidden_width, 1)
-
-        self.use_softplus = use_softplus
-
-    def forward(self, s, a):
-        s_a = torch.cat([s, a], 1)
-        q1 = F.relu(self.l1(s_a))
-        q1 = F.relu(self.l2(q1))
-        if self.use_softplus:
-            q1 = F.softplus(self.l3(q1))
-        else:
-            q1 = self.l3(q1)
-
-        q2 = F.relu(self.l4(s_a))
-        q2 = F.relu(self.l5(q2))
-        if self.use_softplus:
-            q2 = F.softplus(self.l6(q2))
-        else:
-            q2 = self.l6(q2)
-        
-        return q1, q2
-
-class Scalar_Multiplier(nn.Module):
-    def __init__(self, init_value):
-        super().__init__()
-        self.init_value = init_value
-        self.constant = nn.Parameter(
-            torch.tensor(self.init_value, requires_grad=True)
-        )
-
-    def forward(self):
-        return F.softplus(self.constant)
+from network import Double_Critic, Scalar_Multiplier
     
 class SACL(SAC):
     def __init__(self, state_dim, action_dim, max_action, config):
@@ -70,7 +29,7 @@ class SACL(SAC):
         self.penalty_ub = config['penalty_ub']
         self.penalty_lb = config['penalty_lb']
 
-        self.cost_critic = Cost_Critic(state_dim, action_dim, self.hidden_width, use_softplus=config['use_softplus']).to(self.device)
+        self.cost_critic = Double_Critic(state_dim, action_dim, self.hidden_width, use_softplus=config['use_softplus']).to(self.device)
         self.cost_critic_target = copy.deepcopy(self.cost_critic).to(self.device)
 
         self.cost_critic_optimizer = torch.optim.Adam(self.cost_critic.parameters(), lr=self.lr)
@@ -125,8 +84,11 @@ class SACL(SAC):
             alpha_loss = -(self.log_alpha().exp() * (log_pi + self.target_entropy).detach()).mean()
 
         # Constrained part
-        Qc1, Qc2 = self.cost_critic(batch_s, a)
-        Qc= torch.max(Qc1, Qc2)
+        if self.cost_critic.critic_num() == 2:
+            Qc1, Qc2 = self.cost_critic(batch_s, a)
+            Qc= torch.max(Qc1, Qc2)
+        else:
+            Qc = self.cost_critic(batch_s, a)
         violation = Qc - self.cost_limit
         violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
 
@@ -149,8 +111,11 @@ class SACL(SAC):
     def update_multiplier(self, batch_s, result):
         # Constrained part
         a, _ = self.actor(batch_s)
-        Qc1, Qc2 = self.cost_critic(batch_s, a)
-        Qc= torch.max(Qc1, Qc2)
+        if self.cost_critic.critic_num() == 2:
+            Qc1, Qc2 = self.cost_critic(batch_s, a)
+            Qc= torch.max(Qc1, Qc2)
+        else:
+            Qc = self.cost_critic(batch_s, a)
         violation = Qc - self.cost_limit
         violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
 

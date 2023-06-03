@@ -71,9 +71,11 @@ class ReplayBuffer(object):
 
         ss_index = np.random.choice(self.ss_size, size=batch_size)
         batch_ss = torch.tensor(self.ss[ss_index], dtype=torch.float).to(self.device)
-
-        us_index = np.random.choice(self.us_size, size=batch_size)
-        batch_us = torch.tensor(self.us[us_index], dtype=torch.float).to(self.device)
+        if self.us_size == 0:
+            batch_us = None
+        else:
+            us_index = np.random.choice(self.us_size, size=batch_size)
+            batch_us = torch.tensor(self.us[us_index], dtype=torch.float).to(self.device)
 
         return batch_s, batch_a, batch_r, batch_s_, batch_dw, batch_c, batch_cv, batch_ss, batch_us
 
@@ -103,7 +105,10 @@ class SAC_CBF(SACL):
 
     def update_cost_certificate(self, batch_s, batch_s_, batch_ss, batch_us, result):
         feasible_loss = torch.mean(torch.relu(self.certificate(batch_ss)))
-        infeasible_loss = torch.mean(torch.relu(-self.certificate(batch_us)))
+        if batch_us == None:
+            infeasible_loss = 0
+        else:
+            infeasible_loss = torch.mean(torch.relu(-self.certificate(batch_us)))
         invariance = self.certificate(batch_s_) - (1 - self.cbf_lambda) *self.certificate(batch_s)
         invariant_loss = torch.mean(torch.relu(invariance))
         cbf_loss = feasible_loss + infeasible_loss + invariant_loss
@@ -390,7 +395,7 @@ def get_parser():
     parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
     parser.add_argument('--device', default='cuda:3', type=str)
-    parser.add_argument('--wandb', default=False, type=boolean)
+    parser.add_argument('--wandb', default=True, type=boolean)
     parser.add_argument('--seed', default=0, type=int)
 
     parser.add_argument('--max_train_steps', default=int(2e6), type=int)

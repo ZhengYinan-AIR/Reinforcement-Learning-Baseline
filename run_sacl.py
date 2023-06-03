@@ -105,6 +105,7 @@ class SACL(SAC):
             'actor_loss': actor_loss,
             'alpha_loss': alpha_loss,
             'alpha': self.log_alpha().exp().detach().mean(),
+            'actor_qc': Qc.detach().mean(),
         })
         return result
     

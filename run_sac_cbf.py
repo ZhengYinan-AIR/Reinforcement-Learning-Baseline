@@ -394,9 +394,9 @@ def get_parser():
     parser.add_argument('--robot', default='Point', type=str)
     parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
-    parser.add_argument('--device', default='cuda:3', type=str)
+    parser.add_argument('--device', default='cuda:2', type=str)
     parser.add_argument('--wandb', default=True, type=boolean)
-    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--seed', default=10, type=int)
 
     parser.add_argument('--max_train_steps', default=int(2e6), type=int)
     parser.add_argument('--evaluate_freq', default=int(5e3), type=int)
@@ -418,16 +418,16 @@ def get_parser():
     parser.add_argument('--goal_met_done', default=False, type=boolean)
     parser.add_argument('--violation_done', default=False, type=boolean)
 
-    parser.add_argument('--use_reward_scale', default=True, type=boolean)
-    parser.add_argument('--reward_scale', default=200., type=float)
+    parser.add_argument('--use_reward_scale', default=False, type=boolean)
+    parser.add_argument('--reward_scale', default=10., type=float)
 
     # multiplier
     parser.add_argument('--use_multiplier', default=False, type=boolean) # test the sac 
     parser.add_argument('--multiplier_lr', default=3e-4, type=float)
     parser.add_argument('--multiplier_lr_end', default=1e-5, type=float)
     parser.add_argument('--multiplier_update_interval', default=int(5), type=int)
-    parser.add_argument('--multiplier_init', default=0.5, type=float)
-    parser.add_argument('--multiplier_ub', default=25., type=float)
+    parser.add_argument('--multiplier_init', default=1., type=float)
+    parser.add_argument('--multiplier_ub', default=50., type=float)
     parser.add_argument('--penalty_ub', default=100., type=float)
     parser.add_argument('--penalty_lb', default=-1., type=float)
     parser.add_argument('--cost_limit', default=0., type=float) # cbf use Q(s,a)<=0

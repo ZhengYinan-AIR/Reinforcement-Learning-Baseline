@@ -8,12 +8,12 @@ import torch.nn.functional as F
 import numpy as np
 import copy
 import utils
-from utils import boolean
+from utils import boolean, evaluate_policy
 from env.sg.sg import SafetyGymWrapper
 from run_sac import SAC, ReplayBuffer
 
 import wandb
-from tqdm import tqdm
+
 
 from network import Double_Critic, Scalar_Multiplier, MLP_Multiplier
     
@@ -221,33 +221,6 @@ class SACL(SAC):
         self.num_update += 1
 
         return result
-    
-
-def evaluate_policy(env, agent, env_name):
-    times = 10  # Perform evaluations and calculate the average
-    evaluate_reward = 0
-    evaluate_cost = 0
-    for _ in tqdm(range(0, times), ncols=70, desc='Evaluation', initial=1, total=times, ascii=True, disable=os.environ.get("DISABLE_TQDM", False)):
-        s = env.reset()
-        done = False
-        episode_reward = 0
-        episode_cost = 0
-        while not done:
-            a = agent.choose_action(s, deterministic=True)  # We use the deterministic policy during the evaluating
-            s_, r, done, info = env.step(a)
-            if env_name == 'simple_sg':
-                c = info['violation']
-            elif env_name == 'safety_gym':
-                c = info['cost']
-        
-            episode_reward += r
-            episode_cost += c
-
-            s = s_
-        evaluate_reward += episode_reward
-        evaluate_cost += episode_cost
-
-    return int(evaluate_reward / times), int(evaluate_cost / times)
 
 def run(config):
     if config['environment'] == 'simple_sg':

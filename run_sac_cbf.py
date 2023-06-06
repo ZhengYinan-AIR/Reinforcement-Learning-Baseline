@@ -14,7 +14,7 @@ from run_sacl import SACL
 
 import wandb
 from tqdm import tqdm
-from network import Critic, V_critic
+from network import Critic, V_critic, MLP_Multiplier
 
 class ReplayBuffer(object):
     def __init__(self, state_dim, action_dim, device):
@@ -85,6 +85,7 @@ class SAC_CBF(SACL):
         super().__init__(state_dim, action_dim, max_action, config)
 
         self.cbf_lambda = config['cbf_lambda']
+        self.epsilon = config['epsilon']
 
         self.certificate = V_critic(state_dim, self.hidden_width).to(self.device)
         self.certificate_optimizer = torch.optim.Adam(self.certificate.parameters(), lr=self.lr)
@@ -104,12 +105,12 @@ class SAC_CBF(SACL):
         )
 
     def update_cost_certificate(self, batch_s, batch_s_, batch_ss, batch_us, result):
-        feasible_loss = torch.mean(torch.relu(self.certificate(batch_ss)))
+        feasible_loss = torch.mean(torch.relu(self.certificate(batch_ss) + self.epsilon))
         if batch_us == None:
             infeasible_loss = 0
         else:
-            infeasible_loss = torch.mean(torch.relu(-self.certificate(batch_us)))
-        invariance = self.certificate(batch_s_) - (1 - self.cbf_lambda) *self.certificate(batch_s)
+            infeasible_loss = torch.mean(torch.relu(-self.certificate(batch_us) + self.epsilon))
+        invariance = self.certificate(batch_s_) - (1 - self.cbf_lambda) *self.certificate(batch_s) + self.epsilon
         invariant_loss = torch.mean(torch.relu(invariance))
         cbf_loss = feasible_loss + infeasible_loss + invariant_loss
         result.update({
@@ -124,7 +125,7 @@ class SAC_CBF(SACL):
     def update_cost_critic(self, batch_s, batch_a, batch_s_, result): # not need batch_r！
 
         with torch.no_grad():
-            target_Qc = self.certificate(batch_s_) - (1 - self.cbf_lambda) *self.certificate(batch_s)
+            target_Qc = torch.relu(self.certificate(batch_s_) - (1 - self.cbf_lambda) *self.certificate(batch_s))
 
         # Compute current Qc
         current_Qc = self.cost_critic(batch_s, batch_a)
@@ -180,8 +181,6 @@ class SAC_CBF(SACL):
                 torch.nn.utils.clip_grad_norm_(self.log_alpha.parameters(), max_norm=self.grad_norm)
                 self.alpha_optimizer.step()
                 self.alpha = self.log_alpha().exp()
-
-
 
         if self.num_update % self.multiplier_update_interval == 0:
             result = self.update_multiplier(batch_s, result)
@@ -394,9 +393,9 @@ def get_parser():
     parser.add_argument('--robot', default='Point', type=str)
     parser.add_argument('--task', default='Goal1', type=str)
     parser.add_argument('--env_name', default='point', type=str)
-    parser.add_argument('--device', default='cuda:2', type=str)
+    parser.add_argument('--device', default='cuda:3', type=str)
     parser.add_argument('--wandb', default=True, type=boolean)
-    parser.add_argument('--seed', default=10, type=int)
+    parser.add_argument('--seed', default=101, type=int)
 
     parser.add_argument('--max_train_steps', default=int(2e6), type=int)
     parser.add_argument('--evaluate_freq', default=int(5e3), type=int)
@@ -418,22 +417,29 @@ def get_parser():
     parser.add_argument('--goal_met_done', default=False, type=boolean)
     parser.add_argument('--violation_done', default=False, type=boolean)
 
-    parser.add_argument('--use_reward_scale', default=False, type=boolean)
-    parser.add_argument('--reward_scale', default=10., type=float)
+    parser.add_argument('--use_reward_scale', default=True, type=boolean)
+    parser.add_argument('--reward_scale', default=20., type=float)
 
     # multiplier
     parser.add_argument('--use_multiplier', default=False, type=boolean) # test the sac 
     parser.add_argument('--multiplier_lr', default=3e-4, type=float)
     parser.add_argument('--multiplier_lr_end', default=1e-5, type=float)
     parser.add_argument('--multiplier_update_interval', default=int(5), type=int)
-    parser.add_argument('--multiplier_init', default=1., type=float)
+    parser.add_argument('--multiplier_init', default=5., type=float)
     parser.add_argument('--multiplier_ub', default=50., type=float)
     parser.add_argument('--penalty_ub', default=100., type=float)
     parser.add_argument('--penalty_lb', default=-1., type=float)
     parser.add_argument('--cost_limit', default=0., type=float) # cbf use Q(s,a)<=0
 
     parser.add_argument('--use_softplus', default=False, type=boolean) # cbf need value below zero
+    parser.add_argument('--use_mlp_multiplier', default=True, type=boolean) 
+
+    # cbf
     parser.add_argument('--cbf_lambda', default=0.1, type=float) 
+    parser.add_argument('--epsilon', default=1e-2, type=float) 
+    
+
+
 
 
 

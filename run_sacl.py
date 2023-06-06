@@ -15,7 +15,7 @@ from run_sac import SAC, ReplayBuffer
 import wandb
 from tqdm import tqdm
 
-from network import Double_Critic, Scalar_Multiplier
+from network import Double_Critic, Scalar_Multiplier, MLP_Multiplier
     
 class SACL(SAC):
     def __init__(self, state_dim, action_dim, max_action, config):
@@ -40,14 +40,24 @@ class SACL(SAC):
         )
 
         # multiplier
-        self.multiplier_updates_num = int(self.updates_per_training / self.multiplier_update_interval)
-        self.multiplier = Scalar_Multiplier(init_value=config['multiplier_init']).to(self.device)
-        self.multiplier_optimizer = torch.optim.Adam(self.multiplier.parameters(), lr=self.multiplier_lr)
-        self.multiplier_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.multiplier_optimizer,
-            T_max=self.multiplier_updates_num,
-            eta_min=self.multiplier_lr_end
-        )
+        if config['use_mlp_multiplier']:
+            self.multiplier_updates_num = int(self.updates_per_training / self.multiplier_update_interval)
+            self.multiplier = MLP_Multiplier(state_dim, self.hidden_width, config['multiplier_ub']).to(self.device)
+            self.multiplier_optimizer = torch.optim.Adam(self.multiplier.parameters(), lr=self.multiplier_lr)
+            self.multiplier_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.multiplier_optimizer,
+                T_max=self.multiplier_updates_num,
+                eta_min=self.multiplier_lr_end
+            )
+        else:
+            self.multiplier_updates_num = int(self.updates_per_training / self.multiplier_update_interval)
+            self.multiplier = Scalar_Multiplier(init_value=config['multiplier_init']).to(self.device)
+            self.multiplier_optimizer = torch.optim.Adam(self.multiplier.parameters(), lr=self.multiplier_lr)
+            self.multiplier_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.multiplier_optimizer,
+                T_max=self.multiplier_updates_num,
+                eta_min=self.multiplier_lr_end
+            )
 
     def update_cost_critic(self, batch_s, batch_a, batch_s_, batch_dw, batch_c, result): # not need batch_r！
 
@@ -91,8 +101,14 @@ class SACL(SAC):
             Qc = self.cost_critic(batch_s, a)
         violation = Qc - self.cost_limit
         violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
+        print(self.multiplier.func_type())
+        if self.multiplier.func_type() == 'scalar':
+            print(0)
+            multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
+        elif self.multiplier.func_type() == 'mlp':
+            print(1)
+            multiplier = self.multiplier(batch_s)
 
-        multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
         cstr_actor_loss= torch.mean(multiplier.detach() * violation)
 
         actor_loss = uncstr_actor_loss + cstr_actor_loss
@@ -120,15 +136,38 @@ class SACL(SAC):
         violation = Qc - self.cost_limit
         violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
 
-        multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
+        if self.multiplier.func_type() == 'scalar':
+            multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
+            multiplier_loss = -torch.mean(multiplier * violation.detach()) 
 
-        multiplier_loss = -torch.mean(multiplier * violation.detach()) 
+            result.update({
+                'multiplier_loss': multiplier_loss,
+                'multiplier': multiplier.detach().mean(),
+                'violation': violation.detach().mean(),
+            })
 
-        result.update({
-            'multiplier_loss': multiplier_loss,
-            'multiplier': multiplier.detach().mean(),
-            'violation': violation.detach().mean(),
-        })
+        elif self.multiplier.func_type() == 'mlp':
+            multiplier = self.multiplier(batch_s)
+
+            multiplier_safe = torch.mul(violation<=0, multiplier)
+            multiplier_unsafe = torch.mul(violation>0, multiplier)
+
+            unsafe_target = ((violation>0) * self.multiplier_ub).type(torch.float32)
+            unsafe_lam_loss = F.mse_loss(multiplier_unsafe, unsafe_target)
+            safe_lam_loss = -torch.mean(torch.mul(multiplier_safe, violation.detach()))
+            multiplier_loss = safe_lam_loss + unsafe_lam_loss
+
+            result.update({
+                'multiplier_loss': multiplier_loss,
+                'unsafe_lam_loss': unsafe_lam_loss,
+                'safe_lam_loss': safe_lam_loss,
+                'safe_l': multiplier[violation[...,0]<=0].mean(),
+                'unsafe_l': multiplier[violation[...,0]>0].mean(),
+                'violation_unsafe': violation[violation[...,0]<=0].mean(),
+                'violation_safe': violation[violation[...,0]>0].mean()
+            })
+
+
         return result
     
     def learn(self, batch_s, batch_a, batch_r, batch_s_, batch_dw, batch_c, batch_cv, result={}):
@@ -413,6 +452,7 @@ def get_parser():
     parser.add_argument('--penalty_lb', default=-1., type=float)
     parser.add_argument('--cost_limit', default=20., type=float)
     parser.add_argument('--use_softplus', default=True, type=boolean)
+    parser.add_argument('--use_mlp_multiplier', default=True, type=boolean) # cbf need value below zero
 
 
 

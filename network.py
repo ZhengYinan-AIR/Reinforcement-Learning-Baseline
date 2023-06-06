@@ -100,6 +100,9 @@ class Scalar_Multiplier(nn.Module):
 
     def forward(self):
         return F.softplus(self.constant)
+    
+    def func_type(self):
+        return 'scalar'
 
 class Critic(nn.Module):  # single critic network
     def __init__(self, state_dim, action_dim, hidden_width, use_softplus=False):
@@ -138,3 +141,25 @@ class V_critic(nn.Module):
         x = F.relu(self.fc2(x))
         v = self.state_value(x)
         return v
+    
+class MLP_Multiplier(nn.Module):
+    def __init__(self, state_dim, num_hidden, upper_bound):
+        super(MLP_Multiplier, self).__init__()
+
+        self.fc1 = nn.Linear(state_dim, num_hidden)
+        self.fc2 = nn.Linear(num_hidden, num_hidden)
+        self.fc3 = nn.Linear(num_hidden, 1)
+
+        self.upper_bound = upper_bound
+
+    def forward(self, state):
+        state = torch.tanh(self.fc1(state))
+        state = torch.tanh(self.fc2(state))
+        state = self.fc3(state)
+        lam = self.upper_bound/2. * \
+            (1. + torch.tanh(state/self.upper_bound*2 ))
+        return lam
+    
+    def func_type(self):
+        return 'mlp'
+    

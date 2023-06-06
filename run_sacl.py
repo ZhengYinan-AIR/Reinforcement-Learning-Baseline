@@ -101,12 +101,9 @@ class SACL(SAC):
             Qc = self.cost_critic(batch_s, a)
         violation = Qc - self.cost_limit
         violation = torch.clip(violation, min=self.penalty_lb, max=self.penalty_ub)
-        print(self.multiplier.func_type())
         if self.multiplier.func_type() == 'scalar':
-            print(0)
             multiplier = torch.clip(self.multiplier(), 0, self.multiplier_ub)
         elif self.multiplier.func_type() == 'mlp':
-            print(1)
             multiplier = self.multiplier(batch_s)
 
         cstr_actor_loss= torch.mean(multiplier.detach() * violation)

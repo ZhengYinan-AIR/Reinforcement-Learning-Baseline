@@ -160,8 +160,8 @@ class SACL(SAC):
                 'safe_lam_loss': safe_lam_loss,
                 'safe_l': multiplier[violation[...,0]<=0].mean(),
                 'unsafe_l': multiplier[violation[...,0]>0].mean(),
-                'violation_unsafe': violation[violation[...,0]<=0].mean(),
-                'violation_safe': violation[violation[...,0]>0].mean()
+                'violation_safe': violation[violation[...,0]<=0].mean(),
+                'violation_unsafe': violation[violation[...,0]>0].mean()
             })
 
 
@@ -412,7 +412,6 @@ def get_parser():
     parser.add_argument('--reward_scale', default=200., type=float)
 
     # multiplier
-    parser.add_argument('--use_multiplier', default=False, type=boolean) # test the sac 
     parser.add_argument('--multiplier_lr', default=3e-4, type=float)
     parser.add_argument('--multiplier_lr_end', default=1e-5, type=float)
     parser.add_argument('--multiplier_update_interval', default=int(2), type=int)
@@ -422,7 +421,7 @@ def get_parser():
     parser.add_argument('--penalty_lb', default=-1., type=float)
     parser.add_argument('--cost_limit', default=20., type=float)
     parser.add_argument('--use_softplus', default=True, type=boolean)
-    parser.add_argument('--use_mlp_multiplier', default=True, type=boolean) # cbf need value below zero
+    parser.add_argument('--use_mlp_multiplier', default=False, type=boolean) # cbf need value below zero
 
 
 

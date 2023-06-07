@@ -393,7 +393,6 @@ def get_parser():
     parser.add_argument('--reward_scale', default=20., type=float)
 
     # multiplier
-    parser.add_argument('--use_multiplier', default=False, type=boolean) # test the sac 
     parser.add_argument('--multiplier_lr', default=3e-4, type=float)
     parser.add_argument('--multiplier_lr_end', default=1e-5, type=float)
     parser.add_argument('--multiplier_update_interval', default=int(5), type=int)
